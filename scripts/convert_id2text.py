@@ -1,0 +1,50 @@
+import json
+
+split = 'train'
+t = 'greedy_select_contra_rerank_'
+in_path = 'data/search_results_[T][SPLIT].json'.replace('[SPLIT]', split).replace('[T]', t)
+node_path = 'data/bm25_nodes_[SPLIT].json'.replace('[SPLIT]', split)
+
+with open(in_path, 'r', encoding='utf-8') as f:
+    dataset = json.load(f)
+
+with open(node_path, 'r', encoding='utf-8') as f:
+    nodes = json.load(f)
+
+node_id2text = {}
+for item in nodes:
+    for sent_node in item['sent_nodes']:
+        node_id2text[sent_node['sid']] = sent_node['sentences'].strip()
+    
+    for entity_node in item['entity_nodes']:
+        node_id2text[entity_node['eid']] = entity_node['name'].strip()
+    
+    for relation_node in item['relation_nodes']:
+        node_id2text[relation_node['rid']] = relation_node['name'].strip()
+
+results = []
+for data in dataset:
+    index = data['id']
+    claim = data['claim']
+    entry_semantic_texts = []
+    for id in data['entry_sids']:
+        entry_semantic_texts.append(node_id2text[id])
+    entry_entity_texts = []
+    for id in data['entry_nids']:
+        entry_entity_texts.append(node_id2text[id])
+    top_evidence_texts = []
+    for evi in data['top_evidences']:
+        top_evidence_texts.append(evi['text'])
+    
+    results.append({
+        'id': index,
+        'claim': claim,
+        'entry_semantic_texts': entry_semantic_texts,
+        'entry_entity_texts': entry_entity_texts,
+        'top_evidence_texts': top_evidence_texts
+    })
+
+out_path = './data/bm25_noderag_searched_[T][SPLIT].json'.replace('[T]', t).replace('[SPLIT]', split)
+with open(out_path, 'w', encoding='utf-8') as f:
+    json.dump(results, f, indent=4, ensure_ascii=False)
+print(f"save path: {out_path}")

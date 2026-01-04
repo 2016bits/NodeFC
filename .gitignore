@@ -1,0 +1,29 @@
+# 环境变量文件
+.env
+.env.*
+
+# 依赖目录
+node_modules/
+venv/
+__pycache__/
+
+# 编译产物
+dist/
+build/
+*.log
+
+# IDE 文件
+.vscode/
+.idea/
+
+# 系统垃圾文件
+.DS_Store
+Thumbs.db
+
+.vscode
+ckpt_concat_no_trainer
+data
+save_models
+1.json
+1.py
+test.py
