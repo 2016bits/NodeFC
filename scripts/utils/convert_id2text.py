@@ -1,9 +1,18 @@
 import json
+import argparse
 
-split = 'train'
-t = 'greedy_select_contra_rerank_'
-in_path = 'data/search_results_[T][SPLIT].json'.replace('[SPLIT]', split).replace('[T]', t)
-node_path = 'data/bm25_nodes_[SPLIT].json'.replace('[SPLIT]', split)
+parser = argparse.ArgumentParser()
+parser.add_argument('--in_path', type=str, default='data/plan2/[T]_[SPLIT].json')
+parser.add_argument('--node_path', type=str, default='data/plan1/bm25_nodes_[SPLIT].json')
+parser.add_argument('--out_path', type=str, default='./data/plan2/[T]_[SPLIT]_text.json')
+parser.add_argument('--split', type=str, default='dev')
+parser.add_argument('--t', type=str, default='')
+args = parser.parse_args()
+
+split = args.split
+t = args.t
+in_path = args.in_path.replace('[SPLIT]', split).replace('[T]', t)
+node_path = args.node_path.replace('[SPLIT]', split)
 
 with open(in_path, 'r', encoding='utf-8') as f:
     dataset = json.load(f)
@@ -44,7 +53,7 @@ for data in dataset:
         'top_evidence_texts': top_evidence_texts
     })
 
-out_path = './data/bm25_noderag_searched_[T][SPLIT].json'.replace('[T]', t).replace('[SPLIT]', split)
+out_path = args.out_path.replace('[T]', t).replace('[SPLIT]', split)
 with open(out_path, 'w', encoding='utf-8') as f:
     json.dump(results, f, indent=4, ensure_ascii=False)
 print(f"save path: {out_path}")

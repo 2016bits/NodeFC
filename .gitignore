@@ -27,3 +27,4 @@ save_models
 1.json
 1.py
 test.py
+./scripts/gnn/ckpt

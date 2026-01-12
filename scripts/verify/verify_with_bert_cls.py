@@ -160,7 +160,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # paths
-    parser.add_argument("--data_path", type=str, default="./data/verify/noderag_retrieved_[T][TYPE].json")
+    parser.add_argument("--data_path", type=str, default="./data/plan2/[T]_[TYPE]_verifying_data.json")
     parser.add_argument("--saved_model_path", type=str, default="./save_models/bert_cls/bert_cls_[T]_best.pth")
     parser.add_argument("--checkpoint", type=str, default="")  # test 模式时加载
     parser.add_argument("--t", type=str, default="")

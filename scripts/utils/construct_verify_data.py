@@ -1,9 +1,18 @@
 import json
+import argparse
 
-split = 'train'
-t = 'greedy_select_contra_rerank_'
-evidence_path = 'data/bm25_noderag_searched_[T][SPLIT].json'.replace('[SPLIT]', split).replace('[T]', t)
-raw_path = 'data/bm25_[SPLIT].json'.replace('[SPLIT]', split)
+parser = argparse.ArgumentParser()
+parser.add_argument('--evidence_path', type=str, default='data/plan2/[T]_[SPLIT]_text.json')
+parser.add_argument('--raw_path', type=str, default='data/plan1/bm25_[SPLIT].json')
+parser.add_argument('--out_path', type=str, default='./data/plan2/[T]_[SPLIT]_verifying_data.json')
+parser.add_argument('--split', type=str, default='dev')
+parser.add_argument('--t', type=str, default='')
+args = parser.parse_args()
+
+split = args.split
+t = args.t
+evidence_path = args.evidence_path.replace('[SPLIT]', split).replace('[T]', t)
+raw_path = args.raw_path.replace('[SPLIT]', split)
 
 with open(evidence_path, 'r', encoding='utf-8') as f:
     evidences = json.load(f)
@@ -31,7 +40,7 @@ for data in raws:
         'label': label
     })
 
-out_path = './data/noderag_retrieved_[T][SPLIT].json'.replace('[SPLIT]', split).replace('[T]', t)
+out_path = args.out_path.replace('[SPLIT]', split).replace('[T]', t)
 with open(out_path, 'w', encoding='utf-8') as f:
     json.dump(results, f, indent=4, ensure_ascii=False)
 print(f"save path: {out_path}")
