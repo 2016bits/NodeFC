@@ -81,6 +81,20 @@ edges:
 CUDA_VISIBLE_DEVICES=0 python scripts/search_graph.py
 ```
 
+## improve search
+classifier num_hops: 
+- gold: data['num_hops']
+- heuristic: multiple entities OR long complex claim -> multi-hop
+- model: train a hop_classifier
+search graph according different num_hops
+2-hop: (local refined rank)
+3/4-hop: (global graph search + PPR)
+```bash
+sh run_script/gold_hop_search_graph.sh
+sh run_script/heuristic_hop_search_graph.sh
+sh run_script/hop_classifier_search_graph.sh
+```
+
 # convert node id and evidence id to texts
 ```bash
 python scripts/convert_id2text.py
@@ -112,7 +126,7 @@ data:
 }
 ```
 
-# improvement plan
+# verifier
 
 ## train verifier model with GNN
 train gnn:
@@ -126,4 +140,9 @@ CUDA_VISIBLE_DEVICES=1 python train_gnn.py
 CUDA_VISIBLE_DEVICES=0 python scripts/verify/verify_with_bert_cls.py
 ```
 
+# evaluate
+## evaluate retrieved_evidence
+```bash
+python scripts/utils/evaluate_retrieved_evidence.py
+```
 

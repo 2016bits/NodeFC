@@ -77,7 +77,7 @@ def main(args):
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--in_path', type=str, default='data/plan2/nodefc_model_dev_verifying_data.json')
+    parser.add_argument('--in_path', type=str, default='data/plan1/retrieved_greedy_select_contra_rerank_dev.json')
 
     args = parser.parse_args()
     main(args)
