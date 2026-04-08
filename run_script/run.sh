@@ -1,18 +1,3 @@
-torchrun --nproc_per_node=8 scripts/verify/train_verifier_mil.py \
-  --do_train \
-  --t nodefc_heuristic \
-  --bert_model_name bert-base-uncased \
-  --max_ev 5 \
-  --pooling max \
-  --batch_size 16 \
-  --max_len 256
-
-torchrun --nproc_per_node=8 scripts/verify/train_verifier_mil.py \
-  --do_train \
-  --t nodefc_model \
-  --bert_model_name bert-base-uncased \
-  --max_ev 5 \
-  --pooling max \
-  --batch_size 16 \
-  --max_len 256
-
+python scripts/bm25_retrieve.py --topk 20
+python scripts/split_sentence.py
+CUDA_VISIBLE_DEVICES=0 python scripts/construct_graph.py

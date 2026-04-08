@@ -48,7 +48,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--in_path', type=str, default='/mnt/data/yangjun/data/HOVER/data/converted_data/[SPLIT]_full.json')
-    parser.add_argument('--out_path', type=str, default='./data/bm25_[SPLIT].json')
+    parser.add_argument('--out_path', type=str, default='./data/plan2/top[K]/bm25_[SPLIT].json')
     parser.add_argument('--index_path', type=str, default='/mnt/data/yangjun/data/HOVER/corpus/index')
     parser.add_argument('--topk', type=int, default=10)
     parser.add_argument('--split', type=str, default='dev')
