@@ -1,4 +1,4 @@
-import json
+﻿import json
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -7,6 +7,8 @@ parser.add_argument('--raw_path', type=str, default='data/plan1/bm25_[SPLIT].jso
 parser.add_argument('--out_path', type=str, default='./data/plan2/[T]_[SPLIT]_verifying_data.json')
 parser.add_argument('--split', type=str, default='dev')
 parser.add_argument('--t', type=str, default='')
+parser.add_argument('--evidence_field', type=str, default='top_evidence_texts')
+parser.add_argument('--max_evidence', type=int, default=5)
 args = parser.parse_args()
 
 split = args.split
@@ -20,17 +22,24 @@ with open(evidence_path, 'r', encoding='utf-8') as f:
 with open(raw_path, 'r', encoding='utf-8') as f:
     raws = json.load(f)
 
-id2evidence = {item['id']: item['entry_semantic_texts'][:5] for item in evidences}
+id2evidence = {}
+for item in evidences:
+    values = item.get(args.evidence_field)
+    if values is None and args.evidence_field != 'top_evidence_texts':
+        values = item.get('top_evidence_texts')
+    if values is None:
+        values = item.get('entry_semantic_texts', [])
+    id2evidence[item['id']] = values[:args.max_evidence]
 
 results = []
 for data in raws:
     id = data['id']
     claim = data['claim']
     gold_evidence = data['gold_evidence']
-    retrieved_evidence = id2evidence[id]
+    retrieved_evidence = id2evidence.get(id, [])
     num_hops = data['num_hops']
     label = data['label']
-    
+
     results.append({
         'id': id,
         'claim': claim,

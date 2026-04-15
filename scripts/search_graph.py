@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import spacy
 import re
@@ -669,7 +669,7 @@ if __name__ == '__main__':
     
     # NLI rerank
     parser.add_argument('--nli_model', type=str, default='roberta-large-mnli')
-    parser.add_argument('--device', type=str, default='cuda')  # 你之前脚本没 device，这里补上
+    parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--nli_topk', type=int, default=20)
     parser.add_argument('--nli_eta', type=float, default=0.6)  # contradiction bonus in greedy select
 
