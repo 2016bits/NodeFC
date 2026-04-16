@@ -5,7 +5,7 @@ import json
 import argparse
 import unicodedata
 from collections import defaultdict
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Any, Tuple
 
 
 def load_json(path: str):
@@ -15,283 +15,169 @@ def load_json(path: str):
 
 def normalize_text(x: str) -> str:
     """
-    统一字符串格式，减少由于 unicode 组合字符、空格等导致的误匹配。
+    统一 unicode 表示，避免如:
+    'Tomo Zdelarić' vs 'Tomo Zdelarić'
+    这种组合字符不同导致的不匹配。
     """
     if x is None:
         return ""
-    x = unicodedata.normalize("NFKC", str(x))
-    x = x.strip()
+    x = str(x).strip()
+    x = unicodedata.normalize("NFKC", x)
     return x
 
 
-def safe_list(obj, key: str) -> List[str]:
-    v = obj.get(key, [])
-    if v is None:
-        return []
-    return v
+def normalize_list(items: List[str]) -> List[str]:
+    return [normalize_text(x) for x in items if normalize_text(x) != ""]
+
+
+def compute_em_f1(gold_items: List[str], pred_items: List[str]) -> Tuple[float, float]:
+    """
+    对单个样本计算集合级 EM / F1
+    """
+    gold_set = set(normalize_list(gold_items))
+    pred_set = set(normalize_list(pred_items))
+
+    em = 1.0 if gold_set == pred_set else 0.0
+
+    if len(gold_set) == 0 and len(pred_set) == 0:
+        return em, 1.0
+    if len(gold_set) == 0 or len(pred_set) == 0:
+        return em, 0.0
+
+    overlap = len(gold_set & pred_set)
+    precision = overlap / len(pred_set) if len(pred_set) > 0 else 0.0
+    recall = overlap / len(gold_set) if len(gold_set) > 0 else 0.0
+
+    if precision + recall == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
+
+    return em, f1
 
 
 def build_gold_map(gold_data: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {item["id"]: item for item in gold_data}
 
 
-def compute_set_metrics(gold_items: List[str], pred_items: List[str]) -> Dict[str, float]:
-    """
-    对整条 claim 的证据集合计算 EM / Precision / Recall / F1
-    """
-    gold_set = set(normalize_text(x) for x in gold_items if normalize_text(x))
-    pred_set = set(normalize_text(x) for x in pred_items if normalize_text(x))
-
-    tp = len(gold_set & pred_set)
-    fp = len(pred_set - gold_set)
-    fn = len(gold_set - pred_set)
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    em = 1.0 if gold_set == pred_set else 0.0
-
-    return {
-        "em": em,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "gold_count": len(gold_set),
-        "pred_count": len(pred_set),
-    }
-
-
-def compute_per_hop_metrics(gold_items: List[str], pred_items: List[str]) -> Dict[int, Dict[str, float]]:
-    """
-    按“第 i 跳（第 i 个证据位置）”统计。
-    每一跳 gold 和 pred 都只有一个元素，因此：
-      - EM: 是否完全一致
-      - Precision/Recall/F1: 在单标签条件下等价于 EM
-    """
-    max_hops = max(len(gold_items), len(pred_items))
-    results = {}
-
-    for i in range(max_hops):
-        g = normalize_text(gold_items[i]) if i < len(gold_items) else None
-        p = normalize_text(pred_items[i]) if i < len(pred_items) else None
-
-        tp = 1 if (g is not None and p is not None and g == p) else 0
-        fp = 1 if (p is not None and (g is None or p != g)) else 0
-        fn = 1 if (g is not None and (p is None or p != g)) else 0
-
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-        em = 1.0 if (g is not None and p is not None and g == p) else 0.0
-
-        results[i + 1] = {
-            "em": em,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-            "gold": g,
-            "pred": p,
-        }
-
-    return results
-
-
-def aggregate_metric_dict(metric_list: List[Dict[str, float]]) -> Dict[str, float]:
-    if not metric_list:
-        return {
-            "em": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "count": 0,
-        }
-
-    n = len(metric_list)
-    return {
-        "em": sum(x["em"] for x in metric_list) / n,
-        "precision": sum(x["precision"] for x in metric_list) / n,
-        "recall": sum(x["recall"] for x in metric_list) / n,
-        "f1": sum(x["f1"] for x in metric_list) / n,
-        "count": n,
-    }
-
-
-def evaluate(gold_data: List[Dict[str, Any]], pred_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+def evaluate_retrieval(
+    gold_data: List[Dict[str, Any]],
+    pred_data: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     gold_map = build_gold_map(gold_data)
 
-    overall_doc_metrics = []
-    overall_sent_metrics = []
-
-    hop_doc_metrics = defaultdict(list)   # key: hop_idx
-    hop_sent_metrics = defaultdict(list)
-
-    by_num_hops = defaultdict(lambda: {
-        "doc_overall": [],
-        "sent_overall": [],
-        "hop_doc": defaultdict(list),
-        "hop_sent": defaultdict(list),
-    })
-
-    missing_ids = []
-    evaluated = 0
-
-    for pred_item in pred_data:
-        claim_id = pred_item.get("id")
-        if claim_id not in gold_map:
-            missing_ids.append(claim_id)
-            continue
-
-        gold_item = gold_map[claim_id]
-
-        gold_docs = safe_list(gold_item, "gold_doc_titles")
-        pred_docs = safe_list(pred_item, "pred_doc_titles")
-
-        gold_sents = safe_list(gold_item, "gold_sent_keys")
-        pred_sents = safe_list(pred_item, "pred_sent_keys")
-
-        num_hops = gold_item.get("num_hops", len(gold_docs))
-
-        # 总体集合级评估
-        doc_overall = compute_set_metrics(gold_docs, pred_docs)
-        sent_overall = compute_set_metrics(gold_sents, pred_sents)
-
-        overall_doc_metrics.append(doc_overall)
-        overall_sent_metrics.append(sent_overall)
-
-        # 按位置（每一跳）评估
-        doc_hops = compute_per_hop_metrics(gold_docs, pred_docs)
-        sent_hops = compute_per_hop_metrics(gold_sents, pred_sents)
-
-        for hop_idx, m in doc_hops.items():
-            hop_doc_metrics[hop_idx].append(m)
-            by_num_hops[num_hops]["hop_doc"][hop_idx].append(m)
-
-        for hop_idx, m in sent_hops.items():
-            hop_sent_metrics[hop_idx].append(m)
-            by_num_hops[num_hops]["hop_sent"][hop_idx].append(m)
-
-        by_num_hops[num_hops]["doc_overall"].append(doc_overall)
-        by_num_hops[num_hops]["sent_overall"].append(sent_overall)
-
-        evaluated += 1
-
-    results = {
-        "total_gold": len(gold_data),
-        "total_pred": len(pred_data),
-        "evaluated": evaluated,
-        "missing_pred_ids_in_gold": missing_ids,
-        "document_overall": aggregate_metric_dict(overall_doc_metrics),
-        "sentence_overall": aggregate_metric_dict(overall_sent_metrics),
-        "document_per_hop": {},
-        "sentence_per_hop": {},
-        "by_num_hops": {},
+    # 分组统计
+    stats = {
+        "doc": defaultdict(list),   # key: hop number or "overall"
+        "sent": defaultdict(list),
     }
 
-    for hop_idx in sorted(hop_doc_metrics.keys()):
-        results["document_per_hop"][hop_idx] = aggregate_metric_dict(hop_doc_metrics[hop_idx])
+    missing_ids = []
+    evaluated_ids = []
 
-    for hop_idx in sorted(hop_sent_metrics.keys()):
-        results["sentence_per_hop"][hop_idx] = aggregate_metric_dict(hop_sent_metrics[hop_idx])
+    for pred_item in pred_data:
+        sample_id = pred_item.get("id")
+        if sample_id not in gold_map:
+            missing_ids.append(sample_id)
+            continue
 
-    for num_hops, bucket in sorted(by_num_hops.items()):
-        results["by_num_hops"][num_hops] = {
-            "document_overall": aggregate_metric_dict(bucket["doc_overall"]),
-            "sentence_overall": aggregate_metric_dict(bucket["sent_overall"]),
-            "document_per_hop": {
-                hop_idx: aggregate_metric_dict(metrics)
-                for hop_idx, metrics in sorted(bucket["hop_doc"].items())
-            },
-            "sentence_per_hop": {
-                hop_idx: aggregate_metric_dict(metrics)
-                for hop_idx, metrics in sorted(bucket["hop_sent"].items())
-            }
+        gold_item = gold_map[sample_id]
+        evaluated_ids.append(sample_id)
+
+        num_hops = gold_item.get("num_hops", None)
+        if num_hops is None:
+            # 若 gold 里没有 num_hops，则退化为 gold 证据数
+            num_hops = len(gold_item.get("gold_doc_titles", []))
+
+        gold_docs = gold_item.get("gold_doc_titles", [])
+        pred_docs = pred_item.get("pred_doc_titles", [])
+
+        gold_sents = gold_item.get("gold_sent_keys", [])
+        pred_sents = pred_item.get("pred_sent_keys", [])
+
+        doc_em, doc_f1 = compute_em_f1(gold_docs, pred_docs)
+        sent_em, sent_f1 = compute_em_f1(gold_sents, pred_sents)
+
+        stats["doc"][num_hops].append({"em": doc_em, "f1": doc_f1})
+        stats["doc"]["overall"].append({"em": doc_em, "f1": doc_f1})
+
+        stats["sent"][num_hops].append({"em": sent_em, "f1": sent_f1})
+        stats["sent"]["overall"].append({"em": sent_em, "f1": sent_f1})
+
+    def summarize(metric_list: List[Dict[str, float]]) -> Dict[str, float]:
+        if not metric_list:
+            return {"em": 0.0, "f1": 0.0, "count": 0}
+        n = len(metric_list)
+        avg_em = sum(x["em"] for x in metric_list) / n
+        avg_f1 = sum(x["f1"] for x in metric_list) / n
+        return {
+            "em": avg_em * 100,
+            "f1": avg_f1 * 100,
+            "count": n,
         }
+
+    results = {
+        "meta": {
+            "total_gold": len(gold_data),
+            "total_pred": len(pred_data),
+            "evaluated": len(evaluated_ids),
+            "missing_pred_ids_in_gold": missing_ids,
+        },
+        "document_retrieval": {},
+        "sentence_retrieval": {},
+    }
+
+    hop_keys = sorted([k for k in stats["doc"].keys() if k != "overall"])
+    for hop in hop_keys:
+        results["document_retrieval"][str(hop)] = summarize(stats["doc"][hop])
+        results["sentence_retrieval"][str(hop)] = summarize(stats["sent"][hop])
+
+    results["document_retrieval"]["overall"] = summarize(stats["doc"]["overall"])
+    results["sentence_retrieval"]["overall"] = summarize(stats["sent"]["overall"])
 
     return results
 
 
-def pretty_print_results(results: Dict[str, Any]):
-    print("=" * 80)
-    print("Evidence Retrieval Evaluation Report")
-    print("=" * 80)
-    print(f"Total gold examples: {results['total_gold']}")
-    print(f"Total pred examples: {results['total_pred']}")
-    print(f"Evaluated examples : {results['evaluated']}")
-    print(f"Missing pred ids in gold: {len(results['missing_pred_ids_in_gold'])}")
+def format_score(x: float) -> str:
+    return f"{x:.1f}"
+
+
+def print_table_like_paper(results: Dict[str, Any], retrieval_type: str):
+    """
+    retrieval_type:
+      - "document_retrieval"
+      - "sentence_retrieval"
+    """
+    block = results[retrieval_type]
+
+    hop2 = block.get("2", {"em": 0.0, "f1": 0.0})
+    hop3 = block.get("3", {"em": 0.0, "f1": 0.0})
+    hop4 = block.get("4", {"em": 0.0, "f1": 0.0})
+    overall = block.get("overall", {"em": 0.0, "f1": 0.0})
+
+    print("=" * 72)
+    print(retrieval_type.replace("_", " ").title())
+    print("=" * 72)
+    print(f"{'Models':<12}{'2':>12}{'3':>12}{'4':>12}{'Overall':>12}")
+    print(
+        f"{'YourModel':<12}"
+        f"{format_score(hop2['em'])}/{format_score(hop2['f1']):>7}"
+        f"{format_score(hop3['em'])}/{format_score(hop3['f1']):>7}"
+        f"{format_score(hop4['em'])}/{format_score(hop4['f1']):>7}"
+        f"{format_score(overall['em'])}/{format_score(overall['f1']):>7}"
+    )
     print()
 
-    print("[Overall - Document]")
-    for k in ["em", "precision", "recall", "f1", "count"]:
-        print(f"  {k}: {results['document_overall'][k]:.4f}" if k != "count"
-              else f"  {k}: {results['document_overall'][k]}")
-    print()
-
-    print("[Overall - Sentence]")
-    for k in ["em", "precision", "recall", "f1", "count"]:
-        print(f"  {k}: {results['sentence_overall'][k]:.4f}" if k != "count"
-              else f"  {k}: {results['sentence_overall'][k]}")
-    print()
-
-    print("[Per-Hop - Document]")
-    for hop_idx, metrics in results["document_per_hop"].items():
-        print(
-            f"  Hop {hop_idx}: "
-            f"EM={metrics['em']:.4f}, "
-            f"P={metrics['precision']:.4f}, "
-            f"R={metrics['recall']:.4f}, "
-            f"F1={metrics['f1']:.4f}, "
-            f"Count={metrics['count']}"
-        )
-    print()
-
-    print("[Per-Hop - Sentence]")
-    for hop_idx, metrics in results["sentence_per_hop"].items():
-        print(
-            f"  Hop {hop_idx}: "
-            f"EM={metrics['em']:.4f}, "
-            f"P={metrics['precision']:.4f}, "
-            f"R={metrics['recall']:.4f}, "
-            f"F1={metrics['f1']:.4f}, "
-            f"Count={metrics['count']}"
-        )
-    print()
-
-    print("[Grouped by num_hops]")
-    for num_hops, block in results["by_num_hops"].items():
-        print(f"  num_hops = {num_hops}")
-        d = block["document_overall"]
-        s = block["sentence_overall"]
-        print(f"    Document Overall: EM={d['em']:.4f}, P={d['precision']:.4f}, R={d['recall']:.4f}, F1={d['f1']:.4f}, Count={d['count']}")
-        print(f"    Sentence Overall: EM={s['em']:.4f}, P={s['precision']:.4f}, R={s['recall']:.4f}, F1={s['f1']:.4f}, Count={s['count']}")
-
-        print(f"    Document Per-Hop:")
-        for hop_idx, metrics in block["document_per_hop"].items():
+    print("More detailed stats:")
+    for k in ["2", "3", "4", "overall"]:
+        if k in block:
             print(
-                f"      Hop {hop_idx}: "
-                f"EM={metrics['em']:.4f}, "
-                f"P={metrics['precision']:.4f}, "
-                f"R={metrics['recall']:.4f}, "
-                f"F1={metrics['f1']:.4f}, "
-                f"Count={metrics['count']}"
+                f"  {k:>7}: "
+                f"EM={block[k]['em']:.2f}, "
+                f"F1={block[k]['f1']:.2f}, "
+                f"count={block[k]['count']}"
             )
-
-        print(f"    Sentence Per-Hop:")
-        for hop_idx, metrics in block["sentence_per_hop"].items():
-            print(
-                f"      Hop {hop_idx}: "
-                f"EM={metrics['em']:.4f}, "
-                f"P={metrics['precision']:.4f}, "
-                f"R={metrics['recall']:.4f}, "
-                f"F1={metrics['f1']:.4f}, "
-                f"Count={metrics['count']}"
-            )
-        print()
+    print()
 
 
 def main():
@@ -305,8 +191,16 @@ def main():
     gold_data = load_json(args.gold_path.replace('[PLAN]', args.plan))
     pred_data = load_json(args.pred_path.replace('[PLAN]', args.plan))
 
-    results = evaluate(gold_data, pred_data)
-    pretty_print_results(results)
+    results = evaluate_retrieval(gold_data, pred_data)
+
+    print("=" * 72)
+    print("Meta")
+    print("=" * 72)
+    print(json.dumps(results["meta"], ensure_ascii=False, indent=2))
+    print()
+
+    print_table_like_paper(results, "document_retrieval")
+    print_table_like_paper(results, "sentence_retrieval")
 
     save_path = args.save_path.replace('[PLAN]', args.plan)
     if save_path:

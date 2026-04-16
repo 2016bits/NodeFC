@@ -238,11 +238,11 @@ def extract_predicted_evidence(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--retrieval_path', type=str, required=True,
+    parser.add_argument('--retrieval_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000.json',
                         help='Raw retrieval output, e.g. data/plan4.2/nodefc_decomposition_aware_dev_0_4000.json')
     parser.add_argument('--raw_path', type=str, default='data/plan1/bm25_dev.json',
                         help='Raw retrieved-doc file containing retrieved_docs and labels')
-    parser.add_argument('--output_path', type=str, default='data/plan4.2/nodefc_decomposition_aware_dev_0_4000_pred_evidence.json',
+    parser.add_argument('--output_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence.json',
                         help='Output path for extracted predicted evidence')
     parser.add_argument('--topk', type=int, default=0,
                         help='0 means keep all top_evidences from the raw retrieval file')
@@ -250,16 +250,20 @@ def main() -> None:
                         help='Maximum merged span length when matching text back to retrieved docs')
     parser.add_argument('--keep_title_nodes', action='store_true',
                         help='Keep title-only nodes where the sentence equals the document title')
-    parser.add_argument('--stats_path', type=str, default='',
+    parser.add_argument('--stats_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence_stats.json',
                         help='Optional path to save extraction stats as JSON')
+    parser.add_argument('--plan', type=str, default='plan4.3',)
     args = parser.parse_args()
 
-    retrieval_path = Path(args.retrieval_path)
-    raw_path = Path(args.raw_path)
-    output_path = Path(args.output_path)
+    retrieval_path = args.retrieval_path.replace('[PLAN]', args.plan)
+    raw_path = args.raw_path.replace('[PLAN]', args.plan)
+    output_path = args.output_path.replace('[PLAN]', args.plan)
+    stats_path = args.stats_path.replace('[PLAN]', args.plan)
 
-    retrieval_data = load_json(retrieval_path, 'retrieval output')
-    raw_data = load_json(raw_path, 'raw retrieved-doc data')
+    with open(retrieval_path, 'r', encoding='utf-8') as f:
+        retrieval_data = json.load(f)
+    with open(raw_path, 'r', encoding='utf-8') as f:
+        raw_data = json.load(f)
 
     results, stats = extract_predicted_evidence(
         retrieval_data=retrieval_data,
@@ -269,19 +273,13 @@ def main() -> None:
         keep_title_nodes=args.keep_title_nodes,
     )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open('w', encoding='utf-8') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    if args.stats_path:
-        stats_path = Path(args.stats_path)
-        stats_path.parent.mkdir(parents=True, exist_ok=True)
-        with stats_path.open('w', encoding='utf-8') as f:
+    with open(stats_path, 'w', encoding='utf-8') as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
 
     print(f'saved_path={output_path}')
-    print(json.dumps(stats, ensure_ascii=False, indent=2))
-
 
 if __name__ == '__main__':
     main()
