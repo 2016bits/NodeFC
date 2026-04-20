@@ -1,213 +1,331 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json
 import argparse
+import json
 import unicodedata
 from collections import defaultdict
-from typing import Dict, List, Any, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 
 def load_json(path: str):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
-def normalize_text(x: str) -> str:
-    """
-    统一 unicode 表示，避免如:
-    'Tomo Zdelarić' vs 'Tomo Zdelarić'
-    这种组合字符不同导致的不匹配。
-    """
+def normalize_text(x: Any) -> str:
     if x is None:
-        return ""
-    x = str(x).strip()
-    x = unicodedata.normalize("NFKC", x)
+        return ''
+    x = unicodedata.normalize('NFKC', str(x)).strip()
     return x
 
 
-def normalize_list(items: List[str]) -> List[str]:
-    return [normalize_text(x) for x in items if normalize_text(x) != ""]
+def normalize_list(items: Iterable[Any]) -> List[str]:
+    out = []
+    seen = set()
+    for x in items:
+        nx = normalize_text(x)
+        if nx and nx not in seen:
+            seen.add(nx)
+            out.append(nx)
+    return out
 
 
-def compute_em_f1(gold_items: List[str], pred_items: List[str]) -> Tuple[float, float]:
-    """
-    对单个样本计算集合级 EM / F1
-    """
+def compute_set_metrics(gold_items: List[str], pred_items: List[str]) -> Dict[str, float]:
     gold_set = set(normalize_list(gold_items))
     pred_set = set(normalize_list(pred_items))
 
+    tp = len(gold_set & pred_set)
+    fp = len(pred_set - gold_set)
+    fn = len(gold_set - pred_set)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     em = 1.0 if gold_set == pred_set else 0.0
 
-    if len(gold_set) == 0 and len(pred_set) == 0:
-        return em, 1.0
-    if len(gold_set) == 0 or len(pred_set) == 0:
-        return em, 0.0
+    return {
+        'em': em,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'tp': tp,
+        'fp': fp,
+        'fn': fn,
+        'gold_count': len(gold_set),
+        'pred_count': len(pred_set),
+        'hit_count': tp,
+    }
 
-    overlap = len(gold_set & pred_set)
-    precision = overlap / len(pred_set) if len(pred_set) > 0 else 0.0
-    recall = overlap / len(gold_set) if len(gold_set) > 0 else 0.0
 
-    if precision + recall == 0:
-        f1 = 0.0
-    else:
-        f1 = 2 * precision * recall / (precision + recall)
+def compute_oracle_metrics(gold_items: List[str], observed_items: List[str]) -> Dict[str, float]:
+    gold_set = set(normalize_list(gold_items))
+    obs_set = set(normalize_list(observed_items))
 
-    return em, f1
+    if not gold_set:
+        return {
+            'any_hit': 1.0,
+            'all_hit': 1.0,
+            'recall': 1.0,
+            'hit_count': 0,
+            'gold_count': 0,
+        }
+
+    hit_count = len(gold_set & obs_set)
+    return {
+        'any_hit': 1.0 if hit_count > 0 else 0.0,
+        'all_hit': 1.0 if hit_count == len(gold_set) else 0.0,
+        'recall': hit_count / len(gold_set),
+        'hit_count': hit_count,
+        'gold_count': len(gold_set),
+    }
+
+
+def aggregate_set_metrics(metric_list: List[Dict[str, float]]) -> Dict[str, float]:
+    if not metric_list:
+        return {
+            'em': 0.0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'count': 0,
+            'avg_gold_count': 0.0,
+            'avg_pred_count': 0.0,
+            'avg_hit_count': 0.0,
+        }
+    n = len(metric_list)
+    return {
+        'em': sum(x['em'] for x in metric_list) / n,
+        'precision': sum(x['precision'] for x in metric_list) / n,
+        'recall': sum(x['recall'] for x in metric_list) / n,
+        'f1': sum(x['f1'] for x in metric_list) / n,
+        'count': n,
+        'avg_gold_count': sum(x['gold_count'] for x in metric_list) / n,
+        'avg_pred_count': sum(x['pred_count'] for x in metric_list) / n,
+        'avg_hit_count': sum(x['hit_count'] for x in metric_list) / n,
+    }
+
+
+def aggregate_oracle_metrics(metric_list: List[Dict[str, float]]) -> Dict[str, float]:
+    if not metric_list:
+        return {
+            'any_hit': 0.0,
+            'all_hit': 0.0,
+            'recall': 0.0,
+            'count': 0,
+            'avg_gold_count': 0.0,
+            'avg_hit_count': 0.0,
+        }
+    n = len(metric_list)
+    return {
+        'any_hit': sum(x['any_hit'] for x in metric_list) / n,
+        'all_hit': sum(x['all_hit'] for x in metric_list) / n,
+        'recall': sum(x['recall'] for x in metric_list) / n,
+        'count': n,
+        'avg_gold_count': sum(x['gold_count'] for x in metric_list) / n,
+        'avg_hit_count': sum(x['hit_count'] for x in metric_list) / n,
+    }
 
 
 def build_gold_map(gold_data: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {item["id"]: item for item in gold_data}
+    return {item['id']: item for item in gold_data}
 
 
-def evaluate_retrieval(
-    gold_data: List[Dict[str, Any]],
-    pred_data: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+def evaluate_retrieval(gold_data: List[Dict[str, Any]], pred_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     gold_map = build_gold_map(gold_data)
 
-    # 分组统计
-    stats = {
-        "doc": defaultdict(list),   # key: hop number or "overall"
-        "sent": defaultdict(list),
+    grouped = defaultdict(lambda: {
+        'doc_final': [],
+        'sent_final': [],
+        'gold_doc_in_candidates': [],
+        'gold_sent_in_candidates': [],
+        'gold_sent_in_rerank_topk': [],
+        'gold_sent_in_final_selected': [],
+    })
+
+    overall = {
+        'doc_final': [],
+        'sent_final': [],
+        'gold_doc_in_candidates': [],
+        'gold_sent_in_candidates': [],
+        'gold_sent_in_rerank_topk': [],
+        'gold_sent_in_final_selected': [],
     }
 
     missing_ids = []
-    evaluated_ids = []
+    per_claim = []
 
     for pred_item in pred_data:
-        sample_id = pred_item.get("id")
+        sample_id = pred_item.get('id')
         if sample_id not in gold_map:
             missing_ids.append(sample_id)
             continue
 
         gold_item = gold_map[sample_id]
-        evaluated_ids.append(sample_id)
+        num_hops = gold_item.get('num_hops', len(gold_item.get('gold_doc_titles', [])))
 
-        num_hops = gold_item.get("num_hops", None)
-        if num_hops is None:
-            # 若 gold 里没有 num_hops，则退化为 gold 证据数
-            num_hops = len(gold_item.get("gold_doc_titles", []))
+        gold_docs = gold_item.get('gold_doc_titles', []) or []
+        gold_sents = gold_item.get('gold_sent_keys', []) or []
 
-        gold_docs = gold_item.get("gold_doc_titles", [])
-        pred_docs = pred_item.get("pred_doc_titles", [])
+        pred_docs = pred_item.get('pred_doc_titles', []) or []
+        pred_sents = pred_item.get('pred_sent_keys', []) or []
+        candidate_docs = pred_item.get('candidate_doc_titles', []) or []
+        candidate_sents = pred_item.get('candidate_sent_keys', []) or []
+        rerank_topk_sents = pred_item.get('rerank_topk_sent_keys', []) or []
 
-        gold_sents = gold_item.get("gold_sent_keys", [])
-        pred_sents = pred_item.get("pred_sent_keys", [])
+        doc_final = compute_set_metrics(gold_docs, pred_docs)
+        sent_final = compute_set_metrics(gold_sents, pred_sents)
 
-        doc_em, doc_f1 = compute_em_f1(gold_docs, pred_docs)
-        sent_em, sent_f1 = compute_em_f1(gold_sents, pred_sents)
+        gold_doc_in_candidates = compute_oracle_metrics(gold_docs, candidate_docs)
+        gold_sent_in_candidates = compute_oracle_metrics(gold_sents, candidate_sents)
+        gold_sent_in_rerank_topk = compute_oracle_metrics(gold_sents, rerank_topk_sents)
+        gold_sent_in_final_selected = compute_oracle_metrics(gold_sents, pred_sents)
 
-        stats["doc"][num_hops].append({"em": doc_em, "f1": doc_f1})
-        stats["doc"]["overall"].append({"em": doc_em, "f1": doc_f1})
+        grouped[num_hops]['doc_final'].append(doc_final)
+        grouped[num_hops]['sent_final'].append(sent_final)
+        grouped[num_hops]['gold_doc_in_candidates'].append(gold_doc_in_candidates)
+        grouped[num_hops]['gold_sent_in_candidates'].append(gold_sent_in_candidates)
+        grouped[num_hops]['gold_sent_in_rerank_topk'].append(gold_sent_in_rerank_topk)
+        grouped[num_hops]['gold_sent_in_final_selected'].append(gold_sent_in_final_selected)
 
-        stats["sent"][num_hops].append({"em": sent_em, "f1": sent_f1})
-        stats["sent"]["overall"].append({"em": sent_em, "f1": sent_f1})
+        for key, val in [
+            ('doc_final', doc_final),
+            ('sent_final', sent_final),
+            ('gold_doc_in_candidates', gold_doc_in_candidates),
+            ('gold_sent_in_candidates', gold_sent_in_candidates),
+            ('gold_sent_in_rerank_topk', gold_sent_in_rerank_topk),
+            ('gold_sent_in_final_selected', gold_sent_in_final_selected),
+        ]:
+            overall[key].append(val)
 
-    def summarize(metric_list: List[Dict[str, float]]) -> Dict[str, float]:
-        if not metric_list:
-            return {"em": 0.0, "f1": 0.0, "count": 0}
-        n = len(metric_list)
-        avg_em = sum(x["em"] for x in metric_list) / n
-        avg_f1 = sum(x["f1"] for x in metric_list) / n
-        return {
-            "em": avg_em * 100,
-            "f1": avg_f1 * 100,
-            "count": n,
-        }
+        per_claim.append({
+            'id': sample_id,
+            'num_hops': num_hops,
+            'document_final_metrics': doc_final,
+            'sentence_final_metrics': sent_final,
+            'gold_doc_in_candidates': gold_doc_in_candidates,
+            'gold_sent_in_candidates': gold_sent_in_candidates,
+            'gold_sent_in_rerank_topk': gold_sent_in_rerank_topk,
+            'gold_sent_in_final_selected': gold_sent_in_final_selected,
+        })
 
     results = {
-        "meta": {
-            "total_gold": len(gold_data),
-            "total_pred": len(pred_data),
-            "evaluated": len(evaluated_ids),
-            "missing_pred_ids_in_gold": missing_ids,
+        'meta': {
+            'total_gold': len(gold_data),
+            'total_pred': len(pred_data),
+            'evaluated': len(per_claim),
+            'missing_pred_ids_in_gold': missing_ids,
         },
-        "document_retrieval": {},
-        "sentence_retrieval": {},
+        'document_final': aggregate_set_metrics(overall['doc_final']),
+        'sentence_final': aggregate_set_metrics(overall['sent_final']),
+        'oracle': {
+            'gold_doc_in_candidates': aggregate_oracle_metrics(overall['gold_doc_in_candidates']),
+            'gold_sent_in_candidates': aggregate_oracle_metrics(overall['gold_sent_in_candidates']),
+            'gold_sent_in_rerank_topk': aggregate_oracle_metrics(overall['gold_sent_in_rerank_topk']),
+            'gold_sent_in_final_selected': aggregate_oracle_metrics(overall['gold_sent_in_final_selected']),
+        },
+        'by_num_hops': {},
+        'per_claim': per_claim,
     }
 
-    hop_keys = sorted([k for k in stats["doc"].keys() if k != "overall"])
-    for hop in hop_keys:
-        results["document_retrieval"][str(hop)] = summarize(stats["doc"][hop])
-        results["sentence_retrieval"][str(hop)] = summarize(stats["sent"][hop])
-
-    results["document_retrieval"]["overall"] = summarize(stats["doc"]["overall"])
-    results["sentence_retrieval"]["overall"] = summarize(stats["sent"]["overall"])
+    for hop in sorted(grouped.keys()):
+        results['by_num_hops'][str(hop)] = {
+            'document_final': aggregate_set_metrics(grouped[hop]['doc_final']),
+            'sentence_final': aggregate_set_metrics(grouped[hop]['sent_final']),
+            'oracle': {
+                'gold_doc_in_candidates': aggregate_oracle_metrics(grouped[hop]['gold_doc_in_candidates']),
+                'gold_sent_in_candidates': aggregate_oracle_metrics(grouped[hop]['gold_sent_in_candidates']),
+                'gold_sent_in_rerank_topk': aggregate_oracle_metrics(grouped[hop]['gold_sent_in_rerank_topk']),
+                'gold_sent_in_final_selected': aggregate_oracle_metrics(grouped[hop]['gold_sent_in_final_selected']),
+            },
+        }
 
     return results
 
 
-def format_score(x: float) -> str:
-    return f"{x:.1f}"
+def print_set_block(title: str, metrics: Dict[str, float]):
+    print(title)
+    print(f"  EM         : {metrics['em'] * 100:.2f}")
+    print(f"  Precision  : {metrics['precision'] * 100:.2f}")
+    print(f"  Recall     : {metrics['recall'] * 100:.2f}")
+    print(f"  F1         : {metrics['f1'] * 100:.2f}")
+    print(f"  Avg Gold   : {metrics['avg_gold_count']:.4f}")
+    print(f"  Avg Pred   : {metrics['avg_pred_count']:.4f}")
+    print(f"  Avg Hit    : {metrics['avg_hit_count']:.4f}")
+    print(f"  Count      : {metrics['count']}")
 
 
-def print_table_like_paper(results: Dict[str, Any], retrieval_type: str):
-    """
-    retrieval_type:
-      - "document_retrieval"
-      - "sentence_retrieval"
-    """
-    block = results[retrieval_type]
 
-    hop2 = block.get("2", {"em": 0.0, "f1": 0.0})
-    hop3 = block.get("3", {"em": 0.0, "f1": 0.0})
-    hop4 = block.get("4", {"em": 0.0, "f1": 0.0})
-    overall = block.get("overall", {"em": 0.0, "f1": 0.0})
+def print_oracle_block(title: str, metrics: Dict[str, float]):
+    print(title)
+    print(f"  Any Hit    : {metrics['any_hit'] * 100:.2f}")
+    print(f"  All Hit    : {metrics['all_hit'] * 100:.2f}")
+    print(f"  Recall     : {metrics['recall'] * 100:.2f}")
+    print(f"  Avg Gold   : {metrics['avg_gold_count']:.4f}")
+    print(f"  Avg Hit    : {metrics['avg_hit_count']:.4f}")
+    print(f"  Count      : {metrics['count']}")
 
-    print("=" * 72)
-    print(retrieval_type.replace("_", " ").title())
-    print("=" * 72)
-    print(f"{'Models':<12}{'2':>12}{'3':>12}{'4':>12}{'Overall':>12}")
-    print(
-        f"{'YourModel':<12}"
-        f"{format_score(hop2['em'])}/{format_score(hop2['f1']):>7}"
-        f"{format_score(hop3['em'])}/{format_score(hop3['f1']):>7}"
-        f"{format_score(hop4['em'])}/{format_score(hop4['f1']):>7}"
-        f"{format_score(overall['em'])}/{format_score(overall['f1']):>7}"
-    )
+
+def pretty_print(results: Dict[str, Any]):
+    print('=' * 72)
+    print('Meta')
+    print('=' * 72)
+    print(json.dumps(results['meta'], ensure_ascii=False, indent=2))
     print()
 
-    print("More detailed stats:")
-    for k in ["2", "3", "4", "overall"]:
-        if k in block:
-            print(
-                f"  {k:>7}: "
-                f"EM={block[k]['em']:.2f}, "
-                f"F1={block[k]['f1']:.2f}, "
-                f"count={block[k]['count']}"
-            )
+    print('=' * 72)
+    print('Final Retrieval Metrics')
+    print('=' * 72)
+    print_set_block('[Document Final]', results['document_final'])
     print()
+    print_set_block('[Sentence Final]', results['sentence_final'])
+    print()
+
+    print('=' * 72)
+    print('Oracle Diagnostics')
+    print('=' * 72)
+    print_oracle_block('[gold_doc_in_candidates]', results['oracle']['gold_doc_in_candidates'])
+    print()
+    print_oracle_block('[gold_sent_in_candidates]', results['oracle']['gold_sent_in_candidates'])
+    print()
+    print_oracle_block('[gold_sent_in_rerank_topk]', results['oracle']['gold_sent_in_rerank_topk'])
+    print()
+    print_oracle_block('[gold_sent_in_final_selected]', results['oracle']['gold_sent_in_final_selected'])
+    print()
+
+    print('=' * 72)
+    print('Grouped by num_hops')
+    print('=' * 72)
+    for hop, block in results['by_num_hops'].items():
+        print(f'num_hops = {hop}')
+        print_set_block('  [Document Final]', block['document_final'])
+        print_set_block('  [Sentence Final]', block['sentence_final'])
+        print_oracle_block('  [gold_doc_in_candidates]', block['oracle']['gold_doc_in_candidates'])
+        print_oracle_block('  [gold_sent_in_candidates]', block['oracle']['gold_sent_in_candidates'])
+        print_oracle_block('  [gold_sent_in_rerank_topk]', block['oracle']['gold_sent_in_rerank_topk'])
+        print_oracle_block('  [gold_sent_in_final_selected]', block['oracle']['gold_sent_in_final_selected'])
+        print()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gold_path", type=str, default='data/[PLAN]/gold_evidence_dev.json')
-    parser.add_argument("--pred_path", type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence.json')
-    parser.add_argument("--save_path", type=str, default='data/[PLAN]/hover_eval_results.json')
-    parser.add_argument("--plan", type=str, default='plan4.2')
+    parser.add_argument('--gold_path', type=str, default='data/[PLAN]/gold_evidence_dev.json')
+    parser.add_argument('--pred_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence.json')
+    parser.add_argument('--save_path', type=str, default='data/[PLAN]/hover_eval_results.json')
+    parser.add_argument('--plan', type=str, default='plan4.3')
     args = parser.parse_args()
 
     gold_data = load_json(args.gold_path.replace('[PLAN]', args.plan))
     pred_data = load_json(args.pred_path.replace('[PLAN]', args.plan))
 
     results = evaluate_retrieval(gold_data, pred_data)
-
-    print("=" * 72)
-    print("Meta")
-    print("=" * 72)
-    print(json.dumps(results["meta"], ensure_ascii=False, indent=2))
-    print()
-
-    print_table_like_paper(results, "document_retrieval")
-    print_table_like_paper(results, "sentence_retrieval")
+    pretty_print(results)
 
     save_path = args.save_path.replace('[PLAN]', args.plan)
-    if save_path:
-        with open(save_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"Saved results to: {save_path}")
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f'Saved results to: {save_path}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

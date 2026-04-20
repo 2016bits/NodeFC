@@ -1,10 +1,12 @@
 ﻿#!/usr/bin/env python3
 import argparse
-from collections import defaultdict, deque
 import json
-from pathlib import Path
 import re
-from typing import Dict, List, Tuple
+import unicodedata
+from collections import defaultdict
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     from nltk.tokenize.punkt import PunktSentenceTokenizer
@@ -19,137 +21,54 @@ MAPPED_DRIVE_HINT = (
 )
 
 
+# -----------------------------
+# Normalization / sentence split
+# -----------------------------
+
 def normalize_ws(text: str) -> str:
     text = (text or '').replace('\u00a0', ' ')
+    text = unicodedata.normalize('NFKC', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
-
 def sentence_split(text: str) -> List[str]:
+    """
+    Split retrieved doc text into natural sentence units.
+    IMPORTANT: do NOT prepend title as a pseudo-sentence. Gold indices refer to doc sentences,
+    and prepending the title shifts every downstream index by +1.
+    """
     text = text or ''
-    if PunktSentenceTokenizer is not None:
-        tokenizer = PunktSentenceTokenizer()
-        return [normalize_ws(sent) for sent in tokenizer.tokenize(text) if normalize_ws(sent)]
-    parts = re.split(r'(?<=[.!?])\s+', text)
-    return [normalize_ws(sent) for sent in parts if normalize_ws(sent)]
+    parts: List[str] = []
 
-
-
-def base_pieces(text: str) -> List[str]:
-    pieces = []
-    for sent in sentence_split(text):
-        if len(sent) > 10:
-            pieces.append(sent)
-    return pieces
-
-
-
-def choose_spans(pieces: List[str], selected_norms: set, max_span: int) -> Dict[int, Tuple[int, str]]:
-    candidates = []
-    exact_set = set(pieces)
-    n = len(pieces)
-
-    for start in range(n):
-        merged = pieces[start]
-        for end in range(start + 1, min(n, start + max_span)):
-            merged = normalize_ws(merged + ' ' + pieces[end])
-            if merged in selected_norms and merged not in exact_set:
-                span_len = end - start + 1
-                candidates.append((start, end, merged, span_len))
-
-    candidates.sort(key=lambda item: (-item[3], item[0], item[1]))
-
-    used = set()
-    chosen = {}
-    for start, end, merged, _span_len in candidates:
-        if any(idx in used for idx in range(start, end + 1)):
+    # First, respect explicit line breaks from the raw BM25 dump.
+    for line in text.splitlines():
+        line = normalize_ws(line)
+        if not line:
             continue
-        for idx in range(start, end + 1):
-            used.add(idx)
-        chosen[start] = (end, merged)
-
-    return chosen
-
-
-
-def build_doc_units(title: str, text: str, selected_norms: set, max_span: int) -> List[str]:
-    pieces = base_pieces(text)
-    spans = choose_spans(pieces, selected_norms=selected_norms, max_span=max_span)
-
-    units = []
-    if title:
-        units.append(normalize_ws(title))
-
-    idx = 0
-    while idx < len(pieces):
-        if idx in spans:
-            end, merged = spans[idx]
-            units.append(merged)
-            idx = end + 1
-            continue
-        units.append(pieces[idx])
-        idx += 1
-
-    return units
-
-
-
-def build_node_bucket(raw_item: dict, selected_norms: set, max_span: int):
-    bucket = defaultdict(deque)
-
-    for doc in raw_item.get('retrieved_docs', []):
-        title = doc.get('docid', '')
-        units = build_doc_units(
-            title=title,
-            text=doc.get('text', ''),
-            selected_norms=selected_norms,
-            max_span=max_span,
-        )
-        for sent_idx, sent in enumerate(units):
-            bucket[normalize_ws(sent)].append({
-                'title': title,
-                'index': sent_idx,
-                'sentences': sent,
-            })
-
-    return bucket
-
-
-
-def export_one(pred_item: dict, raw_item: dict, max_span: int, drop_title_nodes: bool):
-    selected_texts = [normalize_ws(text) for text in pred_item.get('top_evidence_texts', []) if normalize_ws(text)]
-    selected_norms = set(selected_texts)
-    bucket = build_node_bucket(raw_item, selected_norms=selected_norms, max_span=max_span)
-
-    mapped = []
-    unmatched = 0
-    title_only = 0
-
-    for text in selected_texts:
-        if bucket[text]:
-            node = bucket[text].popleft()
-            if drop_title_nodes and normalize_ws(node['sentences']) == normalize_ws(node['title']):
-                title_only += 1
-                continue
-            mapped.append(node)
+        if PunktSentenceTokenizer is not None:
+            tokenizer = PunktSentenceTokenizer()
+            line_parts = [normalize_ws(s) for s in tokenizer.tokenize(line) if normalize_ws(s)]
         else:
-            unmatched += 1
-
-    pred_doc_titles = list(dict.fromkeys(item['title'] for item in mapped))
-    result = {
-        'id': pred_item['id'],
-        'claim': pred_item['claim'],
-        'label': raw_item.get('label'),
-        'num_hops': raw_item.get('num_hops'),
-        'pred_evidence_list': mapped,
-        'pred_doc_titles': pred_doc_titles,
-        'pred_sent_keys': [f"{item['title']}@@{item['index']}" for item in mapped],
-        'pred_sent_texts': [item['sentences'] for item in mapped],
-    }
-    return result, len(selected_texts), unmatched, title_only
+            line_parts = [normalize_ws(s) for s in re.split(r'(?<=[.!?])\s+', line) if normalize_ws(s)]
+        if line_parts:
+            parts.extend(line_parts)
+        else:
+            parts.append(line)
+    return parts
 
 
+def text_similarity(a: str, b: str) -> float:
+    a_n = normalize_ws(a)
+    b_n = normalize_ws(b)
+    if not a_n or not b_n:
+        return 0.0
+    return SequenceMatcher(None, a_n, b_n).ratio()
+
+
+# -----------------------------
+# Flexible loaders
+# -----------------------------
 
 def load_json(path: Path, label: str):
     try:
@@ -159,6 +78,111 @@ def load_json(path: Path, label: str):
         raise RuntimeError(f'Failed to open {label}: {path}. {exc}. {MAPPED_DRIVE_HINT}') from exc
 
 
+def ensure_examples(obj: Any) -> List[dict]:
+    """
+    Accept either:
+      - a plain list of examples
+      - or a dict wrapper like {"some/file.json": {...single example...}} or {"some/file.json": [..examples..]}
+    """
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        # Common wrapper in pasted samples: {path: payload}
+        if len(obj) == 1:
+            only_val = next(iter(obj.values()))
+            if isinstance(only_val, list):
+                return only_val
+            if isinstance(only_val, dict) and 'id' in only_val:
+                return [only_val]
+        # Already keyed by id? Keep values that look like examples.
+        vals = [v for v in obj.values() if isinstance(v, dict) and 'id' in v]
+        if vals:
+            return vals
+    raise ValueError('Unsupported JSON shape: expected a list of examples or a single-key wrapper.')
+
+
+# -----------------------------
+# Raw doc indexing / matching
+# -----------------------------
+
+def build_raw_doc_index(raw_item: dict) -> Dict[str, Dict[str, Any]]:
+    """
+    Build per-doc sentence index from raw retrieved_docs.
+    Structure:
+      docid -> {
+        'sentences': [sent0, sent1, ...],
+        'norm_to_indices': {norm_sent: [idx1, idx2, ...]}
+      }
+    """
+    doc_index: Dict[str, Dict[str, Any]] = {}
+    for doc in raw_item.get('retrieved_docs', []) or []:
+        docid = normalize_ws(doc.get('docid', ''))
+        if not docid:
+            continue
+        sents = sentence_split(doc.get('text', ''))
+        norm_to_indices: Dict[str, List[int]] = defaultdict(list)
+        for idx, sent in enumerate(sents):
+            norm_to_indices[normalize_ws(sent)].append(idx)
+        doc_index[docid] = {
+            'sentences': sents,
+            'norm_to_indices': norm_to_indices,
+        }
+    return doc_index
+
+
+def find_sentence_match(
+    docid: str,
+    text: str,
+    doc_index: Dict[str, Dict[str, Any]],
+    max_span: int = 4,
+    fuzzy_threshold: float = 0.92,
+) -> Tuple[Optional[int], Optional[str], str, float]:
+    """
+    Return (sent_idx, matched_sentence_text, match_type, score)
+    match_type in {'exact', 'merged', 'fuzzy', 'unmatched'}
+    """
+    docid = normalize_ws(docid)
+    text_n = normalize_ws(text)
+    if not docid or not text_n or docid not in doc_index:
+        return None, None, 'unmatched', 0.0
+
+    doc_info = doc_index[docid]
+    norm_to_indices = doc_info['norm_to_indices']
+    sents = doc_info['sentences']
+
+    # Exact sentence match.
+    if text_n in norm_to_indices and norm_to_indices[text_n]:
+        idx = norm_to_indices[text_n][0]
+        return idx, sents[idx], 'exact', 1.0
+
+    # Merged adjacent span match.
+    n = len(sents)
+    for start in range(n):
+        merged = normalize_ws(sents[start])
+        if merged == text_n:
+            return start, merged, 'exact', 1.0
+        for end in range(start + 1, min(n, start + max_span)):
+            merged = normalize_ws(merged + ' ' + sents[end])
+            if merged == text_n:
+                return start, merged, 'merged', 1.0
+
+    # Fuzzy best match.
+    best_idx = None
+    best_score = 0.0
+    for idx, sent in enumerate(sents):
+        score = text_similarity(text_n, sent)
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+    if best_idx is not None and best_score >= fuzzy_threshold:
+        return best_idx, sents[best_idx], 'fuzzy', best_score
+
+    return None, None, 'unmatched', best_score
+
+
+# -----------------------------
+# Extraction helpers
+# -----------------------------
 
 def normalize_label(label):
     if isinstance(label, str):
@@ -166,120 +190,266 @@ def normalize_label(label):
     return label
 
 
+def dedup_nodes(nodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for node in nodes:
+        key = (normalize_ws(node.get('title')), node.get('index'))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(node)
+    return out
 
-def build_text_only_pred_items(retrieval_data: List[dict], topk: int) -> List[dict]:
-    pred_items = []
-    for item in retrieval_data:
-        texts = []
-        for ev in item.get('top_evidences', []) or []:
-            text = normalize_ws(ev.get('text', ''))
-            if text:
-                texts.append(text)
-            if topk > 0 and len(texts) >= topk:
-                break
-        pred_items.append({
-            'id': item['id'],
-            'claim': item.get('claim', ''),
-            'top_evidence_texts': texts,
-            'num_hops': item.get('num_hops'),
-            'label': item.get('label'),
+
+def dedup_strs(items: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in items:
+        x_n = normalize_ws(x)
+        if not x_n or x_n in seen:
+            continue
+        seen.add(x_n)
+        out.append(x_n)
+    return out
+
+
+def convert_candidates_to_nodes(
+    candidates: List[dict],
+    doc_index: Dict[str, Dict[str, Any]],
+    max_span: int,
+    fuzzy_threshold: float,
+    topk: int = 0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    if topk > 0:
+        candidates = candidates[:topk]
+
+    mapped: List[Dict[str, Any]] = []
+    stats = {'exact': 0, 'merged': 0, 'fuzzy': 0, 'unmatched': 0}
+    for cand in candidates:
+        docid = normalize_ws(cand.get('docid', ''))
+        text = normalize_ws(cand.get('text', ''))
+        if not docid or not text:
+            stats['unmatched'] += 1
+            continue
+        sent_idx, matched_text, match_type, score = find_sentence_match(
+            docid=docid,
+            text=text,
+            doc_index=doc_index,
+            max_span=max_span,
+            fuzzy_threshold=fuzzy_threshold,
+        )
+        if sent_idx is None:
+            stats['unmatched'] += 1
+            continue
+        stats[match_type] += 1
+        mapped.append({
+            'title': docid,
+            'index': sent_idx,
+            'sentences': matched_text or text,
+            'source_text': text,
+            'sid': cand.get('sid'),
+            'match_type': match_type,
+            'match_score': score,
+            'support_type': cand.get('support_type'),
+            'fact_id': cand.get('fact_id'),
+            'fact_role': cand.get('fact_role'),
+            'aggregate_score': cand.get('aggregate_score'),
         })
-    return pred_items
+    return dedup_nodes(mapped), stats
 
+
+def extract_fact_trace_candidates(item: dict) -> List[dict]:
+    out: List[dict] = []
+    for trace in item.get('fact_traces', []) or []:
+        for cand in trace.get('top_candidates', []) or []:
+            if isinstance(cand, dict):
+                out.append(cand)
+    return out
+
+
+# -----------------------------
+# Main extraction
+# -----------------------------
+
+def export_one(
+    retrieval_item: dict,
+    raw_item: dict,
+    rerank_topk: int,
+    max_span: int,
+    fuzzy_threshold: float,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    doc_index = build_raw_doc_index(raw_item)
+
+    # Final selected evidence: use top_evidences directly, not top_evidence_texts.
+    final_nodes, final_stats = convert_candidates_to_nodes(
+        candidates=list(retrieval_item.get('top_evidences', []) or []),
+        doc_index=doc_index,
+        max_span=max_span,
+        fuzzy_threshold=fuzzy_threshold,
+        topk=0,
+    )
+
+    reranked_all = list(retrieval_item.get('reranked_candidates', []) or [])
+    rerank_nodes_all, rerank_all_stats = convert_candidates_to_nodes(
+        candidates=reranked_all,
+        doc_index=doc_index,
+        max_span=max_span,
+        fuzzy_threshold=fuzzy_threshold,
+        topk=0,
+    )
+    rerank_nodes_topk, rerank_topk_stats = convert_candidates_to_nodes(
+        candidates=reranked_all,
+        doc_index=doc_index,
+        max_span=max_span,
+        fuzzy_threshold=fuzzy_threshold,
+        topk=rerank_topk,
+    )
+
+    fact_top_candidates = extract_fact_trace_candidates(retrieval_item)
+    fact_candidate_nodes, fact_candidate_stats = convert_candidates_to_nodes(
+        candidates=fact_top_candidates,
+        doc_index=doc_index,
+        max_span=max_span,
+        fuzzy_threshold=fuzzy_threshold,
+        topk=0,
+    )
+
+    # Candidate pool for oracle: use union of global reranked candidates and per-fact top candidates.
+    union_candidate_nodes = dedup_nodes(rerank_nodes_all + fact_candidate_nodes)
+
+    pred_doc_titles = dedup_strs(node['title'] for node in final_nodes)
+    pred_sent_keys = [f"{node['title']}@@{node['index']}" for node in final_nodes]
+
+    candidate_doc_titles = dedup_strs(node['title'] for node in union_candidate_nodes)
+    candidate_sent_keys = [f"{node['title']}@@{node['index']}" for node in union_candidate_nodes]
+
+    rerank_topk_doc_titles = dedup_strs(node['title'] for node in rerank_nodes_topk)
+    rerank_topk_sent_keys = [f"{node['title']}@@{node['index']}" for node in rerank_nodes_topk]
+
+    result = {
+        'id': retrieval_item['id'],
+        'claim': retrieval_item.get('claim', ''),
+        'label': normalize_label(raw_item.get('label', retrieval_item.get('label'))),
+        'num_hops': raw_item.get('num_hops', retrieval_item.get('num_hops')),
+
+        # Final evidence
+        'pred_evidence_list': [
+            {'title': n['title'], 'index': n['index'], 'sentences': n['sentences']}
+            for n in final_nodes
+        ],
+        'pred_doc_titles': pred_doc_titles,
+        'pred_sent_keys': pred_sent_keys,
+        'pred_sent_texts': [n['sentences'] for n in final_nodes],
+
+        # Oracle layers
+        'candidate_doc_titles': candidate_doc_titles,
+        'candidate_sent_keys': candidate_sent_keys,
+        'rerank_topk_doc_titles': rerank_topk_doc_titles,
+        'rerank_topk_sent_keys': rerank_topk_sent_keys,
+
+        # Optional debugging info
+        'debug_final_match_info': final_nodes,
+        'debug_rerank_topk_match_info': rerank_nodes_topk,
+    }
+
+    stats = {
+        'final': final_stats,
+        'rerank_all': rerank_all_stats,
+        'rerank_topk': rerank_topk_stats,
+        'fact_candidates': fact_candidate_stats,
+        'candidate_union_size': len(union_candidate_nodes),
+        'final_size': len(final_nodes),
+        'rerank_topk_size': len(rerank_nodes_topk),
+    }
+    return result, stats
 
 
 def extract_predicted_evidence(
     retrieval_data: List[dict],
     raw_data: List[dict],
-    topk: int,
+    rerank_topk: int,
     max_span: int,
-    keep_title_nodes: bool,
-) -> Tuple[List[dict], Dict[str, int]]:
-    pred_items = build_text_only_pred_items(retrieval_data, topk=topk)
-    id2raw = {item['id']: item for item in raw_data}
+    fuzzy_threshold: float,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    raw_map = {item['id']: item for item in raw_data}
 
-    results = []
+    results: List[dict] = []
     stats = {
         'examples': 0,
-        'selected_texts': 0,
-        'unmatched': 0,
-        'title_only_dropped': 0,
-        'empty_examples': 0,
         'missing_raw_examples': 0,
+        'final_exact': 0,
+        'final_merged': 0,
+        'final_fuzzy': 0,
+        'final_unmatched': 0,
+        'candidate_unmatched_total': 0,
+        'rerank_topk_unmatched_total': 0,
+        'empty_final_examples': 0,
     }
 
-    for pred_item in pred_items:
-        raw_item = id2raw.get(pred_item['id'])
+    for retrieval_item in retrieval_data:
+        raw_item = raw_map.get(retrieval_item.get('id'))
         if raw_item is None:
             stats['missing_raw_examples'] += 1
             continue
-
-        exported, selected_count, unmatched_count, title_only_count = export_one(
-            pred_item=pred_item,
+        exported, one_stats = export_one(
+            retrieval_item=retrieval_item,
             raw_item=raw_item,
+            rerank_topk=rerank_topk,
             max_span=max_span,
-            drop_title_nodes=not keep_title_nodes,
+            fuzzy_threshold=fuzzy_threshold,
         )
-        exported['label'] = normalize_label(exported.get('label', pred_item.get('label')))
-        if exported.get('num_hops') is None:
-            exported['num_hops'] = pred_item.get('num_hops')
         results.append(exported)
-
         stats['examples'] += 1
-        stats['selected_texts'] += selected_count
-        stats['unmatched'] += unmatched_count
-        stats['title_only_dropped'] += title_only_count
+        stats['final_exact'] += one_stats['final']['exact']
+        stats['final_merged'] += one_stats['final']['merged']
+        stats['final_fuzzy'] += one_stats['final']['fuzzy']
+        stats['final_unmatched'] += one_stats['final']['unmatched']
+        stats['candidate_unmatched_total'] += one_stats['fact_candidates']['unmatched'] + one_stats['rerank_all']['unmatched']
+        stats['rerank_topk_unmatched_total'] += one_stats['rerank_topk']['unmatched']
         if not exported['pred_evidence_list']:
-            stats['empty_examples'] += 1
+            stats['empty_final_examples'] += 1
 
     return results, stats
 
 
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--retrieval_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000.json',
-                        help='Raw retrieval output, e.g. data/plan4.2/nodefc_decomposition_aware_dev_0_4000.json')
-    parser.add_argument('--raw_path', type=str, default='data/plan1/bm25_dev.json',
-                        help='Raw retrieved-doc file containing retrieved_docs and labels')
-    parser.add_argument('--output_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence.json',
-                        help='Output path for extracted predicted evidence')
-    parser.add_argument('--topk', type=int, default=0,
-                        help='0 means keep all top_evidences from the raw retrieval file')
-    parser.add_argument('--max_span', type=int, default=8,
-                        help='Maximum merged span length when matching text back to retrieved docs')
-    parser.add_argument('--keep_title_nodes', action='store_true',
-                        help='Keep title-only nodes where the sentence equals the document title')
-    parser.add_argument('--stats_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence_stats.json',
-                        help='Optional path to save extraction stats as JSON')
-    parser.add_argument('--plan', type=str, default='plan4.3',)
+    parser.add_argument('--retrieval_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000.json')
+    parser.add_argument('--raw_path', type=str, default='data/plan1/bm25_dev.json')
+    parser.add_argument('--output_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence.json')
+    parser.add_argument('--stats_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence_stats.json')
+    parser.add_argument('--plan', type=str, default='plan4.3')
+    parser.add_argument('--rerank_topk', type=int, default=10)
+    parser.add_argument('--max_span', type=int, default=4)
+    parser.add_argument('--fuzzy_threshold', type=float, default=0.92)
     args = parser.parse_args()
 
-    retrieval_path = args.retrieval_path.replace('[PLAN]', args.plan)
-    raw_path = args.raw_path.replace('[PLAN]', args.plan)
-    output_path = args.output_path.replace('[PLAN]', args.plan)
-    stats_path = args.stats_path.replace('[PLAN]', args.plan)
+    retrieval_path = Path(args.retrieval_path.replace('[PLAN]', args.plan))
+    raw_path = Path(args.raw_path.replace('[PLAN]', args.plan))
+    output_path = Path(args.output_path.replace('[PLAN]', args.plan))
+    stats_path = Path(args.stats_path.replace('[PLAN]', args.plan))
 
-    with open(retrieval_path, 'r', encoding='utf-8') as f:
-        retrieval_data = json.load(f)
-    with open(raw_path, 'r', encoding='utf-8') as f:
-        raw_data = json.load(f)
+    retrieval_data = ensure_examples(load_json(retrieval_path, 'retrieval_path'))
+    raw_data = ensure_examples(load_json(raw_path, 'raw_path'))
 
     results, stats = extract_predicted_evidence(
         retrieval_data=retrieval_data,
         raw_data=raw_data,
-        topk=args.topk,
+        rerank_topk=args.rerank_topk,
         max_span=args.max_span,
-        keep_title_nodes=args.keep_title_nodes,
+        fuzzy_threshold=args.fuzzy_threshold,
     )
 
-    with open(output_path, 'w', encoding='utf-8') as f:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open('w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-
-    with open(stats_path, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
+    with stats_path.open('w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
 
     print(f'saved_path={output_path}')
+    print(f'stats_path={stats_path}')
+
 
 if __name__ == '__main__':
     main()

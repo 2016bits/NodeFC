@@ -78,71 +78,18 @@ edges:
 
 # search graph
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/search_graph.py
-```
-
-## improve search
-classifier num_hops: 
-- gold: data['num_hops']
-- heuristic: multiple entities OR long complex claim -> multi-hop
-- model: train a hop_classifier
-search graph according different num_hops
-2-hop: (local refined rank)
-3/4-hop: (global graph search + PPR)
-```bash
-sh run_script/gold_hop_search_graph.sh
-sh run_script/heuristic_hop_search_graph.sh
-sh run_script/hop_classifier_search_graph.sh
-```
-
-# convert node id and evidence id to texts
-```bash
-python scripts/convert_id2text.py
-```
-data:
-```
-{
-    'id': index,
-    'claim': claim,
-    'entry_semantic_texts': entry_semantic_texts,   # text
-    'entry_entity_texts': entry_entity_texts,       # text
-    'top_evidence_texts': top_evidence_texts        # text
-}
-```
-
-# construct data for crwon verification
-```bash
-python scripts/construct_verify_data.py
-```
-data:
-```
-{
-    'id': id,
-    'claim': claim,
-    'gold_evidence': gold_evidence,
-    'retrieved_evidence': retrieved_evidence,
-    'num_hops': num_hops,
-    'label': label
-}
-```
-
-# verifier
-
-## train verifier model with GNN
-train gnn:
-```bash
-cd scripts/gnn
-CUDA_VISIBLE_DEVICES=1 python train_gnn.py
-```
-
-## train bert+cls model for verifier
-```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/verify/verify_with_bert_cls.py
+CUDA_VISIBLE_DEVICES=0 python scripts/search_graph_decomposition_aware.py
 ```
 
 # evaluate
+## extract evidence text for evaluation
+```bash
+python scripts
+python scripts/utils/extract_hover_predicted_evidence.py --plan plan4.3
+```
+
 ## evaluate retrieved_evidence
 ```bash
-python scripts/utils/evaluate_retrieved_evidence.py
+python scripts/utils/evaluate_evidence_retrieval.py --plan plan4.3
 ```
 
