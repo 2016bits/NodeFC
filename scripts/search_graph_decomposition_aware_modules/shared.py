@@ -633,9 +633,54 @@ def candidate_rank_key(candidate):
     )
 
 
+def get_fact_direct_winner_budget(fact, fact_role):
+    if fact_role == "bridge":
+        return 0
+    if fact_role == "anchor":
+        return 2
+    if fact_role == "verify":
+        return 3 if fact.get("critical") else 2
+    return 1
+
+
+def get_fact_bridge_helper_budget(fact, fact_stats, args):
+    depth = ((fact_stats or {}).get("depth_map") or {}).get(fact.get("id"), 1)
+    if fact.get("critical") or depth >= args.multi_bridge_depth_threshold:
+        return args.max_bridge_per_complex_fact
+    return args.max_bridge_per_fact
+
+
+def compute_fact_coverage_status(
+    fact,
+    fact_role,
+    has_direct_support,
+    dependency_closure_ready,
+    has_bridge_support=False,
+):
+    requires_direct = requires_direct_support(fact_role, fact)
+    closure_ready = bool(dependency_closure_ready)
+    support_ready = bool(has_direct_support) if requires_direct else bool(has_direct_support or has_bridge_support)
+
+    if requires_direct:
+        covered = support_ready
+        fully_covered = support_ready and closure_ready
+    else:
+        covered = support_ready and closure_ready
+        fully_covered = covered
+
+    return {
+        "requires_direct_support": bool(requires_direct),
+        "support_ready": bool(support_ready),
+        "closure_ready": bool(closure_ready),
+        "covered": bool(covered),
+        "fully_covered": bool(fully_covered),
+    }
+
+
 def compute_fact_covered_hard(fact, fact_role, has_direct_support, dependency_closure_ready):
-    if fact_role in {"verify", "anchor"}:
-        return bool(has_direct_support and dependency_closure_ready)
-    if requires_direct_support(fact_role, fact):
-        return bool(has_direct_support and dependency_closure_ready)
-    return bool(dependency_closure_ready)
+    return compute_fact_coverage_status(
+        fact=fact,
+        fact_role=fact_role,
+        has_direct_support=has_direct_support,
+        dependency_closure_ready=dependency_closure_ready,
+    )["fully_covered"]

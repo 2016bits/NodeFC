@@ -27,8 +27,9 @@ from search_graph_decomposition_aware_modules.shared import (
     build_support_profile,
     candidate_rank_key,
     clamp_score,
-    compute_fact_covered_hard,
+    compute_fact_coverage_status,
     derive_binding_requirements,
+    get_fact_direct_winner_budget,
     get_direct_support_threshold,
     get_role_candidate_budget,
     infer_fact_role,
@@ -391,42 +392,60 @@ def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidat
     parent_covered = all((parent.get("coverage_summary") or {}).get("covered", False) for parent in parent_results)
     direct_candidates = sorted([cand for cand in scored_candidates if cand.get("direct_support_pass")], key=candidate_rank_key, reverse=True)
     bridge_candidates = sorted([cand for cand in scored_candidates if cand.get("bridge_support_pass")], key=candidate_rank_key, reverse=True)
-    requires_direct = requires_direct_support(fact_role, fact)
-
-    dependency_closure = (not fact.get("rely_on")) or any(cand.get("dependency_closure_ready") for cand in direct_candidates)
-    hard_has_direct = bool(direct_candidates)
-    covered = compute_fact_covered_hard(
+    has_direct_support = bool(direct_candidates)
+    has_bridge_support = bool(bridge_candidates)
+    dependency_closure = (not fact.get("rely_on")) or any(
+        cand.get("dependency_closure_ready") for cand in (direct_candidates + bridge_candidates)
+    )
+    coverage_status = compute_fact_coverage_status(
         fact=fact,
         fact_role=fact_role,
-        has_direct_support=hard_has_direct,
+        has_direct_support=has_direct_support,
         dependency_closure_ready=bool(parent_covered and dependency_closure),
+        has_bridge_support=has_bridge_support,
     )
 
     best_candidate = scored_candidates[0] if scored_candidates else None
     best_direct = direct_candidates[0] if direct_candidates else None
     best_bridge = bridge_candidates[0] if bridge_candidates else None
 
-    direct_winners = direct_candidates[:1]
-    critical_backups = direct_candidates[1:2] if fact.get("critical") else []
-    support_seed_candidates = list(direct_winners + critical_backups)
+    direct_winner_budget = get_fact_direct_winner_budget(fact, fact_role)
+    direct_winners = direct_candidates[:direct_winner_budget]
+    bridge_winners = bridge_candidates[:1] if fact_role == "bridge" else []
+
+    support_seed_candidates = list(direct_winners if direct_winners else bridge_winners)
     seen_sids = {cand["sid"] for cand in support_seed_candidates}
     for cand in bridge_candidates:
         if cand["sid"] not in seen_sids:
             support_seed_candidates.append(cand)
             seen_sids.add(cand["sid"])
 
+    needs_direct_repair = bool(coverage_status["requires_direct_support"] and not has_direct_support)
+    if fact_role == "bridge":
+        needs_bridge_repair = bool(fact.get("rely_on")) and bool(parent_covered) and (
+            not coverage_status["covered"] or not coverage_status["fully_covered"]
+        )
+    else:
+        needs_bridge_repair = bool(fact.get("rely_on")) and bool(parent_covered) and bool(
+            coverage_status["support_ready"] and not coverage_status["fully_covered"]
+        )
+
     return {
-        "covered": bool(parent_covered and covered),
+        "covered": bool(parent_covered and coverage_status["covered"]),
+        "fully_covered": bool(parent_covered and coverage_status["fully_covered"]),
         "parent_covered": bool(parent_covered),
-        "requires_direct_support": bool(requires_direct),
-        "has_direct_support": bool(hard_has_direct),
+        "requires_direct_support": bool(coverage_status["requires_direct_support"]),
+        "support_ready": bool(coverage_status["support_ready"]),
+        "closure_ready": bool(coverage_status["closure_ready"]),
+        "has_direct_support": bool(has_direct_support),
+        "has_bridge_support": bool(has_bridge_support),
         "dependency_closure": bool(dependency_closure),
-        "needs_direct_repair": bool(requires_direct and not direct_candidates),
-        "needs_bridge_repair": bool(fact.get("rely_on")) and bool(parent_covered) and bool(direct_candidates) and not bool(dependency_closure),
+        "needs_direct_repair": bool(needs_direct_repair),
+        "needs_bridge_repair": bool(needs_bridge_repair),
         "top_fact_score": float(best_candidate["fact_score"]) if best_candidate else 0.0,
         "top_direct_support_score": float(best_direct["direct_support_score"]) if best_direct else 0.0,
         "top_bridge_support_score": float(best_bridge["bridge_support_score"]) if best_bridge else 0.0,
-        "num_coverage_candidates": len(direct_candidates),
+        "num_coverage_candidates": len(direct_candidates if coverage_status["requires_direct_support"] else bridge_candidates),
         "num_direct_candidates": len(direct_candidates),
         "num_bridge_candidates": len(bridge_candidates),
         "best_direct_sid": best_direct["sid"] if best_direct else None,
@@ -434,14 +453,14 @@ def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidat
         "direct_candidates": direct_candidates,
         "bridge_candidates": bridge_candidates,
         "direct_winners": direct_winners,
-        "critical_backups": critical_backups,
+        "bridge_winners": bridge_winners,
         "support_seed_candidates": support_seed_candidates,
     }
 
 
 def coverage_insufficient(fact, fact_role, parent_results, scored_candidates, args):
     summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args)
-    return not summary["covered"] or summary["needs_direct_repair"] or summary["needs_bridge_repair"]
+    return not summary["fully_covered"] or summary["needs_direct_repair"] or summary["needs_bridge_repair"]
 
 
 def build_chain_bridge_sentence_map(binding_requirements, parent_results, context, args):
@@ -758,6 +777,11 @@ def retrieve_one_fact(
         coverage_summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored, args)
 
     support_seed_candidates = coverage_summary["support_seed_candidates"] if coverage_summary["support_seed_candidates"] else scored
+    support_profile_k = max(
+        args.parent_support_k,
+        len(coverage_summary.get("direct_winners") or []),
+        len(coverage_summary.get("bridge_winners") or []),
+    )
     return {
         "fact_id": fact["id"],
         "text": fact["text"],
@@ -771,6 +795,6 @@ def retrieve_one_fact(
         "entry_r": entry_r,
         "fact_profile": profile,
         "coverage_summary": coverage_summary,
-        "support_profile": build_support_profile(support_seed_candidates, context, max_candidates=args.parent_support_k),
+        "support_profile": build_support_profile(support_seed_candidates, context, max_candidates=support_profile_k),
         "candidates": scored[:args.per_fact_output_k],
     }

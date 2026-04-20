@@ -287,19 +287,12 @@ def compute_direct_support_pass(
     args,
 ):
     threshold = get_direct_support_threshold(fact_role, args)
-
-    completeness_ok = (
-        entity_pair >= args.min_entity_pair_for_direct
-        and relation_match >= args.min_relation_match_for_direct
-        and bool(binding.get("direct_hit") or binding.get("score", 0.0) >= args.binding_threshold)
-        and negation_compatibility >= args.min_negation_compat_for_direct
-        and context_independence >= args.min_context_independence_for_direct
+    relation_or_keyword_ready = (
+        relation_match > 0.0
+        or keyword_overlap >= args.min_keyword_overlap_for_direct_fallback
     )
-
-    if fact_role == "anchor" and (profile["numbers"] or profile["time_tokens"] or profile["quantity_tokens"]):
-        completeness_ok = completeness_ok and constraint_consistency >= args.min_constraint_consistency_for_anchor
-
-    if fact_role == "verify" and fact.get("critical"):
-        completeness_ok = completeness_ok and keyword_overlap >= args.min_keyword_overlap_for_critical_direct
-
-    return bool(direct_support_score >= threshold and completeness_ok)
+    return bool(
+        direct_support_score >= threshold
+        and entity_pair >= args.min_entity_pair_for_direct
+        and relation_or_keyword_ready
+    )
