@@ -1,0 +1,776 @@
+from collections import defaultdict
+
+import numpy as np
+
+from search_graph_hopaware import make_personalization, norm_text, ppr
+
+from search_graph_decomposition_aware_modules.scoring import (
+    compute_direct_support_pass,
+    score_background_penalty,
+    score_binding_coverage,
+    score_bridge_features,
+    score_context_independence,
+    score_entity_pair_presence,
+    score_fact_completeness_penalty,
+    score_keyword_overlap,
+    score_negation_compatibility,
+    score_relation_expression,
+    score_target_match,
+    score_time_quantity_consistency,
+    score_upstream_bridge,
+)
+from search_graph_decomposition_aware_modules.shared import (
+    build_constraint_entry,
+    build_dependency_seed_maps,
+    build_fact_profile,
+    build_parent_support_summary,
+    build_support_profile,
+    candidate_rank_key,
+    clamp_score,
+    compute_fact_covered_hard,
+    derive_binding_requirements,
+    get_direct_support_threshold,
+    get_role_candidate_budget,
+    infer_fact_role,
+    merge_score_maps,
+    normalize_sentence_node_scores,
+    requires_direct_support,
+    rerank_cross_encoder,
+    select_sentence_candidates,
+    semantic_entry_from_bank,
+    top_score_items,
+    topk_normalize,
+)
+
+
+def build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="base", topk=None):
+    scores = defaultdict(float)
+    binding_requirements = derive_binding_requirements(fact, profile, parent_results)
+    parent_summary = build_parent_support_summary(parent_results)
+    budget = topk or max(args.fact_candidate_k, get_role_candidate_budget(fact_role, bool(fact.get("critical")), args) * 2)
+
+    for sid in context["sid_list"]:
+        candidate = {"sid": sid}
+        target_match = score_target_match(profile, candidate, context)
+        entity_pair = score_entity_pair_presence(profile, sid, context)
+        relation_match = score_relation_expression(profile, sid, context)
+        keyword_overlap = score_keyword_overlap(profile, sid, context)
+        constraint_consistency = max(0.0, score_time_quantity_consistency(profile, candidate, context))
+        negation_compatibility = max(0.0, score_negation_compatibility(profile, context["sid2meta"][sid]["text"]))
+        bridge = score_bridge_features(sid, parent_summary, context, context["semantic_sim_map"], args)
+        binding = score_binding_coverage(binding_requirements, candidate, context)
+        same_parent_doc = 1.0 if context["sid2meta"].get(sid, {}).get("docid") in parent_summary["docids"] else 0.0
+
+        if mode == "direct":
+            score = 0.34 * entity_pair + 0.24 * relation_match + 0.18 * keyword_overlap + 0.14 * constraint_consistency + 0.10 * target_match
+            if fact_role == "verify":
+                score += 0.08 * entity_pair + 0.04 * keyword_overlap
+            elif fact_role == "anchor":
+                score += 0.12 * constraint_consistency
+        elif mode == "bridge":
+            score = 0.36 * bridge["score"] + 0.28 * binding["score"] + 0.16 * same_parent_doc + 0.12 * relation_match + 0.08 * keyword_overlap
+            if fact_role == "bridge":
+                score += 0.10 * bridge["entity_overlap"] + 0.06 * bridge["relation_overlap"]
+        else:
+            score = 0.24 * entity_pair + 0.18 * relation_match + 0.18 * keyword_overlap + 0.16 * target_match + 0.10 * constraint_consistency + 0.04 * negation_compatibility + 0.10 * binding["score"]
+            if fact_role == "verify":
+                score += 0.08 * entity_pair + 0.06 * keyword_overlap
+            elif fact_role == "bridge":
+                score += 0.10 * bridge["score"] + 0.06 * same_parent_doc
+            elif fact_role == "anchor":
+                score += 0.14 * constraint_consistency
+
+        if score > 0:
+            scores[sid] = float(score)
+
+    return topk_normalize(scores, budget)
+
+
+def build_direct_repair_query_text(fact, profile, context):
+    parts = []
+    entity_names = []
+    for eid, _ in top_score_items(profile["entry_n"], 2):
+        name = context["eid2name"].get(str(eid)) or context["eid2norm"].get(str(eid))
+        if name:
+            entity_names.append(name)
+    if entity_names:
+        parts.append(" ".join(entity_names))
+    relation_terms = sorted(profile.get("relation_keywords") or set())
+    if relation_terms:
+        parts.append(" ".join(relation_terms[:6]))
+    parts.append(fact.get("text", ""))
+    if profile.get("constraint_text"):
+        parts.append(profile["constraint_text"])
+
+    ordered = []
+    seen = set()
+    for part in parts:
+        norm = norm_text(part)
+        if norm and norm not in seen:
+            seen.add(norm)
+            ordered.append(norm)
+    return " ".join(ordered)
+
+
+def build_bridge_repair_query_text(fact, profile, parent_results, context):
+    parent_summary = build_parent_support_summary(parent_results)
+    parts = [fact.get("text", "")]
+
+    entity_names = []
+    for eid in sorted(parent_summary["eids"], key=lambda x: str(x)):
+        name = context["eid2name"].get(str(eid)) or context["eid2norm"].get(str(eid))
+        if name:
+            entity_names.append(name)
+        if len(entity_names) >= 3:
+            break
+    if entity_names:
+        parts.append(" ".join(entity_names))
+
+    relation_names = []
+    for rid in sorted(parent_summary["rids"], key=lambda x: str(x)):
+        name = context["rid2name"].get(str(rid)) or context["rid2norm"].get(str(rid))
+        if name:
+            relation_names.append(name)
+        if len(relation_names) >= 2:
+            break
+    if relation_names:
+        parts.append(" ".join(relation_names))
+
+    if profile.get("constraint_text"):
+        parts.append(profile["constraint_text"])
+
+    ordered = []
+    seen = set()
+    for part in parts:
+        norm = norm_text(part)
+        if norm and norm not in seen:
+            seen.add(norm)
+            ordered.append(norm)
+    return " ".join(ordered)
+
+
+def filter_anchor_candidates(candidates, profile, context, args):
+    if not candidates or not (profile["numbers"] or profile["time_tokens"] or profile["quantity_tokens"]):
+        return candidates
+
+    annotated = []
+    for cand in candidates:
+        item = dict(cand)
+        item["_constraint_consistency"] = score_time_quantity_consistency(profile, item, context)
+        annotated.append(item)
+
+    filtered = [item for item in annotated if item["_constraint_consistency"] >= args.anchor_prefilter_threshold]
+    if not filtered:
+        keep = min(len(annotated), max(6, len(annotated) // 2))
+        filtered = sorted(annotated, key=lambda x: (x["_constraint_consistency"], x["recall_score"]), reverse=True)[:keep]
+    else:
+        filtered = sorted(filtered, key=lambda x: (x["_constraint_consistency"], x["recall_score"]), reverse=True)
+
+    for item in filtered:
+        item.pop("_constraint_consistency", None)
+    return filtered
+
+
+def get_role_ranking_weights(fact_role):
+    if fact_role == "bridge":
+        return {
+            "ce": 0.26,
+            "dense": 0.08,
+            "lexical": 0.12,
+            "entity_pair": 0.12,
+            "relation": 0.14,
+            "target": 0.08,
+            "constraint": 0.04,
+            "negation": 0.02,
+            "context": 0.08,
+            "background_penalty": 0.10,
+            "bridge_bonus": 0.28,
+        }
+    if fact_role == "anchor":
+        return {
+            "ce": 0.24,
+            "dense": 0.08,
+            "lexical": 0.14,
+            "entity_pair": 0.10,
+            "relation": 0.10,
+            "target": 0.08,
+            "constraint": 0.18,
+            "negation": 0.02,
+            "context": 0.08,
+            "background_penalty": 0.12,
+            "bridge_bonus": 0.08,
+        }
+    return {
+        "ce": 0.30,
+        "dense": 0.10,
+        "lexical": 0.16,
+        "entity_pair": 0.14,
+        "relation": 0.12,
+        "target": 0.10,
+        "constraint": 0.06,
+        "negation": 0.03,
+        "context": 0.09,
+        "background_penalty": 0.12,
+        "bridge_bonus": 0.10,
+    }
+
+
+def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, context, args, critical_bonus):
+    if not reranked:
+        return []
+
+    binding_requirements = derive_binding_requirements(fact, profile, parent_results)
+    parents_covered = all((parent.get("coverage_summary") or {}).get("covered", False) for parent in parent_results)
+
+    ce_vals = np.array([cand.get("ce_score", 0.0) for cand in reranked], dtype=np.float32)
+    dense_vals = np.array([cand.get("dense_score", 0.0) for cand in reranked], dtype=np.float32)
+    lexical_vals = np.array([cand.get("lexical_score", 0.0) for cand in reranked], dtype=np.float32)
+    dependency_vals = np.array([cand.get("dependency_score", 0.0) for cand in reranked], dtype=np.float32)
+    ppr_vals = np.array([cand.get("ppr_score", 0.0) for cand in reranked], dtype=np.float32)
+
+    def _norm(value, values):
+        vmin = float(values.min())
+        vmax = float(values.max())
+        if vmax - vmin < 1e-12:
+            return 0.0
+        return (float(value) - vmin) / (vmax - vmin)
+
+    weights = get_role_ranking_weights(fact_role)
+    direct_threshold = get_direct_support_threshold(fact_role, args)
+    scored = []
+
+    for cand in reranked:
+        ce_norm = _norm(cand.get("ce_score", 0.0), ce_vals)
+        dense_norm = _norm(cand.get("dense_score", 0.0), dense_vals)
+        lexical_norm = _norm(cand.get("lexical_score", 0.0), lexical_vals)
+        dependency_norm = _norm(cand.get("dependency_score", 0.0), dependency_vals)
+        ppr_norm = _norm(cand.get("ppr_score", 0.0), ppr_vals)
+
+        semantic_relevance = 0.72 * ce_norm + 0.18 * dense_norm + 0.10 * lexical_norm
+        target_match = score_target_match(profile, cand, context)
+        entity_pair = score_entity_pair_presence(profile, cand["sid"], context)
+        relation_match = score_relation_expression(profile, cand["sid"], context)
+        keyword_overlap = score_keyword_overlap(profile, cand["sid"], context)
+        constraint_consistency = score_time_quantity_consistency(profile, cand, context)
+        negation_compatibility = score_negation_compatibility(profile, cand["text"])
+        context_independence = score_context_independence(profile, cand["sid"], context)
+        background_penalty = score_background_penalty(profile, cand["sid"], context, entity_pair, relation_match, keyword_overlap, constraint_consistency)
+        bridge = score_upstream_bridge(cand, parent_results, context, context["semantic_sim_map"], args)
+        binding = score_binding_coverage(binding_requirements, cand, context)
+        doc_rank_bonus = 1.0 / (1.0 + max(0, cand.get("doc_rank", 10**9)))
+
+        direct_support_score = clamp_score(
+            weights["ce"] * ce_norm
+            + weights["dense"] * dense_norm
+            + weights["lexical"] * lexical_norm
+            + weights["entity_pair"] * entity_pair
+            + weights["relation"] * relation_match
+            + weights["target"] * target_match
+            + weights["constraint"] * max(0.0, constraint_consistency)
+            + weights["negation"] * max(0.0, negation_compatibility)
+            + weights["context"] * context_independence
+            - weights["background_penalty"] * background_penalty
+        )
+        bridge_support_score = clamp_score(
+            0.48 * max(0.0, bridge["score"])
+            + 0.27 * binding["score"]
+            + 0.15 * dependency_norm
+            + 0.10 * ppr_norm
+        )
+
+        direct_support_pass = compute_direct_support_pass(
+            fact=fact,
+            profile=profile,
+            fact_role=fact_role,
+            cand=cand,
+            relation_match=relation_match,
+            entity_pair=entity_pair,
+            target_match=target_match,
+            keyword_overlap=keyword_overlap,
+            constraint_consistency=constraint_consistency,
+            negation_compatibility=negation_compatibility,
+            context_independence=context_independence,
+            binding=binding,
+            direct_support_score=direct_support_score,
+            args=args,
+        )
+
+        bridge_support_pass = bridge_support_score >= args.bridge_threshold or bridge["satisfied"] or binding["score"] >= args.binding_threshold
+        dependency_closure_ready = (
+            not fact.get("rely_on")
+            or binding["direct_hit"]
+            or binding["score"] >= args.binding_threshold
+            or bridge["satisfied"]
+            or bridge["score"] >= args.bridge_threshold
+        )
+
+        binding_satisfied = bool(binding["direct_hit"] or binding["score"] >= args.binding_threshold)
+        completeness_penalty = score_fact_completeness_penalty({
+            "entity_pair_score": entity_pair,
+            "relation_match_score": relation_match,
+            "binding_satisfied": binding_satisfied,
+            "context_independence": context_independence,
+        }, fact_role, args)
+
+        support_type = "direct_support" if direct_support_pass else ("bridge_support" if bridge_support_pass else "candidate")
+
+        fact_score = clamp_score(
+            0.62 * direct_support_score
+            + 0.16 * max(0.0, constraint_consistency)
+            + 0.10 * context_independence
+            + 0.12 * max(0.0, negation_compatibility)
+            - args.fact_completeness_penalty_weight * completeness_penalty
+        )
+        aggregate_score = (
+            1.55 * direct_support_score
+            + 0.60 * ce_norm
+            + 0.22 * lexical_norm
+            + 0.18 * dense_norm
+            + (0.30 if fact_role == "anchor" else 0.18) * max(0.0, constraint_consistency)
+            + 0.12 * max(0.0, negation_compatibility)
+            + 0.08 * context_independence
+            + weights["bridge_bonus"] * bridge_support_score
+            + 0.05 * ppr_norm
+            + args.doc_rank_weight * doc_rank_bonus
+            + critical_bonus
+            - 0.20 * background_penalty
+            - args.fact_completeness_penalty_weight * completeness_penalty
+        )
+        coverage_score = 0.74 * direct_support_score + 0.16 * bridge_support_score + 0.10 * max(0.0, constraint_consistency)
+
+        if fact_role == "verify" and not direct_support_pass:
+            aggregate_score -= args.verify_no_direct_support_margin
+            fact_score = max(0.0, fact_score - 0.5 * args.verify_no_direct_support_margin)
+
+        if requires_direct_support(fact_role, fact):
+            coverage_gate_pass = direct_support_pass and parents_covered and dependency_closure_ready
+        else:
+            coverage_gate_pass = parents_covered and ((direct_support_pass and dependency_closure_ready) or bridge_support_pass)
+
+        item = dict(cand)
+        item.update({
+            "fact_id": fact["id"],
+            "fact_role": fact_role,
+            "semantic_relevance": float(semantic_relevance),
+            "entity_target_match": float(target_match),
+            "entity_pair_score": float(entity_pair),
+            "relation_match_score": float(relation_match),
+            "keyword_overlap": float(keyword_overlap),
+            "time_quantity_consistency": float(constraint_consistency),
+            "negation_compatibility": float(negation_compatibility),
+            "context_independence": float(context_independence),
+            "background_penalty": float(background_penalty),
+            "dependency_compatibility": float(bridge["score"]),
+            "critical_coverage_bonus": float(critical_bonus),
+            "doc_rank_bonus": float(doc_rank_bonus),
+            "fact_score": float(fact_score),
+            "binding_score": float(binding["score"]),
+            "binding_satisfied": bool(binding_satisfied),
+            "bridge_score": float(bridge["score"]),
+            "bridge_satisfied": bool(bridge["satisfied"] or bridge["score"] >= args.bridge_threshold),
+            "bridge_support_score": float(bridge_support_score),
+            "bridge_support_pass": bool(bridge_support_pass),
+            "direct_support_score": float(direct_support_score),
+            "direct_support_pass": bool(direct_support_pass),
+            "direct_threshold": float(direct_threshold),
+            "dependency_closure_ready": bool(dependency_closure_ready),
+            "support_type": support_type,
+            "cross_doc_bridge_score": float(bridge["cross_doc"]),
+            "coverage_score": float(coverage_score),
+            "aggregate_score": float(aggregate_score),
+            "coverage_gate_pass": bool(coverage_gate_pass),
+            "fact_completeness_penalty": float(completeness_penalty),
+        })
+        scored.append(item)
+
+    scored.sort(key=candidate_rank_key, reverse=True)
+    return scored
+
+
+def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args):
+    parent_covered = all((parent.get("coverage_summary") or {}).get("covered", False) for parent in parent_results)
+    direct_candidates = sorted([cand for cand in scored_candidates if cand.get("direct_support_pass")], key=candidate_rank_key, reverse=True)
+    bridge_candidates = sorted([cand for cand in scored_candidates if cand.get("bridge_support_pass")], key=candidate_rank_key, reverse=True)
+    requires_direct = requires_direct_support(fact_role, fact)
+
+    dependency_closure = (not fact.get("rely_on")) or any(cand.get("dependency_closure_ready") for cand in direct_candidates)
+    hard_has_direct = bool(direct_candidates)
+    covered = compute_fact_covered_hard(
+        fact=fact,
+        fact_role=fact_role,
+        has_direct_support=hard_has_direct,
+        dependency_closure_ready=bool(parent_covered and dependency_closure),
+    )
+
+    best_candidate = scored_candidates[0] if scored_candidates else None
+    best_direct = direct_candidates[0] if direct_candidates else None
+    best_bridge = bridge_candidates[0] if bridge_candidates else None
+
+    direct_winners = direct_candidates[:1]
+    critical_backups = direct_candidates[1:2] if fact.get("critical") else []
+    support_seed_candidates = list(direct_winners + critical_backups)
+    seen_sids = {cand["sid"] for cand in support_seed_candidates}
+    for cand in bridge_candidates:
+        if cand["sid"] not in seen_sids:
+            support_seed_candidates.append(cand)
+            seen_sids.add(cand["sid"])
+
+    return {
+        "covered": bool(parent_covered and covered),
+        "parent_covered": bool(parent_covered),
+        "requires_direct_support": bool(requires_direct),
+        "has_direct_support": bool(hard_has_direct),
+        "dependency_closure": bool(dependency_closure),
+        "needs_direct_repair": bool(requires_direct and not direct_candidates),
+        "needs_bridge_repair": bool(fact.get("rely_on")) and bool(parent_covered) and bool(direct_candidates) and not bool(dependency_closure),
+        "top_fact_score": float(best_candidate["fact_score"]) if best_candidate else 0.0,
+        "top_direct_support_score": float(best_direct["direct_support_score"]) if best_direct else 0.0,
+        "top_bridge_support_score": float(best_bridge["bridge_support_score"]) if best_bridge else 0.0,
+        "num_coverage_candidates": len(direct_candidates),
+        "num_direct_candidates": len(direct_candidates),
+        "num_bridge_candidates": len(bridge_candidates),
+        "best_direct_sid": best_direct["sid"] if best_direct else None,
+        "best_bridge_sid": best_bridge["sid"] if best_bridge else None,
+        "direct_candidates": direct_candidates,
+        "bridge_candidates": bridge_candidates,
+        "direct_winners": direct_winners,
+        "critical_backups": critical_backups,
+        "support_seed_candidates": support_seed_candidates,
+    }
+
+
+def coverage_insufficient(fact, fact_role, parent_results, scored_candidates, args):
+    summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args)
+    return not summary["covered"] or summary["needs_direct_repair"] or summary["needs_bridge_repair"]
+
+
+def build_chain_bridge_sentence_map(binding_requirements, parent_results, context, args):
+    scores = defaultdict(float)
+    parent_summary = build_parent_support_summary(parent_results)
+    for sid in context["sid_list"]:
+        binding = score_binding_coverage(binding_requirements, {"sid": sid}, context)
+        bridge = score_bridge_features(sid, parent_summary, context, context["semantic_sim_map"], args)
+        score = 0.45 * binding["score"] + 0.45 * bridge["score"] + 0.10 * bridge["cross_doc"]
+        if score > 0:
+            scores[sid] = score
+    return topk_normalize(scores, args.chain_seed_k)
+
+
+def build_chain_completion_entries(
+    fact,
+    profile,
+    base_entry_s,
+    base_entry_n,
+    base_entry_r,
+    scored_candidates,
+    claim_entry_s,
+    claim_entry_n,
+    parent_results,
+    context,
+    args,
+):
+    expanded_s = defaultdict(float, base_entry_s)
+    expanded_n = defaultdict(float, base_entry_n)
+    expanded_r = defaultdict(float, base_entry_r)
+    binding_requirements = derive_binding_requirements(fact, profile, parent_results)
+    parent_summary = build_parent_support_summary(parent_results)
+
+    for sid in parent_summary["sids"]:
+        expanded_s[sid] += args.chain_parent_sentence_weight
+    for eid in parent_summary["eids"]:
+        expanded_n[eid] += args.chain_parent_neighbor_weight
+    for rid in parent_summary["rids"]:
+        expanded_r[rid] += args.chain_parent_neighbor_weight
+
+    for sid, score in build_chain_bridge_sentence_map(binding_requirements, parent_results, context, args).items():
+        expanded_s[sid] += args.chain_binding_sentence_weight * float(score)
+
+    for eid in binding_requirements["eids"]:
+        expanded_n[eid] += args.chain_binding_anchor_weight
+    for rid in binding_requirements["rids"]:
+        expanded_r[rid] += args.chain_binding_anchor_weight
+
+    for cand in scored_candidates[:args.chain_seed_k]:
+        if cand["bridge_score"] >= args.bridge_threshold or cand["binding_score"] >= args.binding_threshold or cand["fact_score"] >= args.fact_score_threshold:
+            seed_weight = 0.5 * max(cand["fact_score"], cand["bridge_score"], cand["binding_score"])
+            expanded_s[cand["sid"]] += seed_weight
+            for eid in context["sid2eids"].get(cand["sid"], set()):
+                expanded_n[eid] += 0.25 * seed_weight
+            for rid in context["sid2rids"].get(cand["sid"], set()):
+                expanded_r[rid] += 0.25 * seed_weight
+
+    if fact.get("critical"):
+        for cand in scored_candidates[:args.chain_seed_k]:
+            expanded_s[cand["sid"]] += args.chain_critical_seed_weight * cand["fact_score"]
+        for eid, score in top_score_items(profile["entry_n"], 4):
+            expanded_n[eid] += args.chain_critical_seed_weight * float(score)
+        for rid, score in top_score_items(profile["entry_r"], 4):
+            expanded_r[rid] += args.chain_critical_seed_weight * float(score)
+        if not parent_results:
+            for sid, score in sorted(claim_entry_s.items(), key=lambda x: x[1], reverse=True)[:args.chain_seed_k]:
+                expanded_s[sid] += args.chain_claim_weight * float(score)
+            for eid, score in top_score_items(claim_entry_n, 4):
+                expanded_n[eid] += args.chain_claim_weight * float(score)
+
+    return dict(expanded_s), dict(expanded_n), dict(expanded_r)
+
+
+def build_targeted_direct_repair_candidates(
+    fact,
+    profile,
+    fact_role,
+    context,
+    sentence_bank,
+    biencoder,
+    parent_results,
+    args,
+):
+    budget = args.critical_direct_repair_candidate_k if fact.get("critical") else args.direct_repair_candidate_k
+    topk = max(budget * 2, args.fact_k)
+    direct_lexical = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="direct", topk=topk)
+    query_text = build_direct_repair_query_text(fact, profile, context)
+    direct_dense = topk_normalize(semantic_entry_from_bank(biencoder, query_text, sentence_bank, topk=topk), topk)
+    constraint_entry = build_constraint_entry(profile, biencoder, sentence_bank, topk=topk)
+    combined = merge_score_maps(
+        (args.direct_repair_lexical_weight, direct_lexical),
+        (args.direct_repair_dense_weight, direct_dense),
+        (0.40, constraint_entry),
+    )
+    candidates = select_sentence_candidates(
+        context,
+        combined,
+        topk=budget,
+        component_maps={
+            "dense_score": direct_dense,
+            "lexical_score": direct_lexical,
+            "constraint_score": constraint_entry,
+            "dependency_score": {},
+            "ppr_score": {},
+        },
+    )
+    if fact_role == "anchor":
+        candidates = filter_anchor_candidates(candidates, profile, context, args)
+    return candidates
+
+
+def build_targeted_bridge_repair_candidates(
+    fact,
+    profile,
+    fact_role,
+    claim_entry_s,
+    claim_entry_n,
+    context,
+    sentence_bank,
+    graph,
+    scored_candidates,
+    parent_results,
+    biencoder,
+    args,
+):
+    if not parent_results:
+        return []
+    budget = args.bridge_repair_candidate_k
+    topk = max(budget * 2, args.chain_seed_k)
+    bridge_lexical = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="bridge", topk=topk)
+    query_text = build_bridge_repair_query_text(fact, profile, parent_results, context)
+    bridge_dense = topk_normalize(semantic_entry_from_bank(biencoder, query_text, sentence_bank, topk=topk), topk)
+
+    dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
+    exp_s, exp_n, exp_r = build_chain_completion_entries(
+        fact,
+        profile,
+        bridge_lexical,
+        merge_score_maps((1.0, profile["entry_n"]), (args.dependency_seed_weight, dep_entry_n)),
+        merge_score_maps((1.0, profile["entry_r"]), (args.dependency_seed_weight, dep_entry_r)),
+        scored_candidates,
+        claim_entry_s,
+        claim_entry_n,
+        parent_results,
+        context,
+        args,
+    )
+    exp_personalization = make_personalization(exp_s, exp_n, exp_r, w_s=args.w_entry_s, w_n=args.w_entry_n, w_r=args.w_entry_r)
+    ppr_scores = normalize_sentence_node_scores(ppr(graph, exp_personalization, alpha=args.ppr_alpha, max_iter=args.ppr_max_iter), topk)
+    combined = merge_score_maps(
+        (args.bridge_repair_lexical_weight, bridge_lexical),
+        (args.bridge_repair_dense_weight, bridge_dense),
+        (args.ppr_expand_weight, ppr_scores),
+    )
+    candidates = select_sentence_candidates(
+        context,
+        combined,
+        topk=budget,
+        component_maps={
+            "dense_score": bridge_dense,
+            "lexical_score": bridge_lexical,
+            "constraint_score": {},
+            "dependency_score": bridge_lexical,
+            "ppr_score": ppr_scores,
+        },
+    )
+    if fact_role == "anchor":
+        candidates = filter_anchor_candidates(candidates, profile, context, args)
+    return candidates
+
+
+def merge_recall_candidates(*candidate_lists):
+    merged = {}
+    for candidates in candidate_lists:
+        for cand in candidates:
+            sid = cand["sid"]
+            prev = merged.get(sid)
+            if prev is None:
+                merged[sid] = dict(cand)
+                continue
+            better = cand if (
+                cand.get("recall_score", 0.0),
+                cand.get("lexical_score", 0.0),
+                cand.get("dense_score", 0.0),
+            ) > (
+                prev.get("recall_score", 0.0),
+                prev.get("lexical_score", 0.0),
+                prev.get("dense_score", 0.0),
+            ) else prev
+            item = dict(better)
+            for field in ("recall_score", "dense_score", "lexical_score", "constraint_score", "dependency_score", "ppr_score", "graph_score"):
+                item[field] = max(float(prev.get(field, 0.0)), float(cand.get(field, 0.0)))
+            merged[sid] = item
+    return sorted(merged.values(), key=lambda x: (x.get("recall_score", 0.0), x.get("lexical_score", 0.0), x.get("dense_score", 0.0)), reverse=True)
+
+
+def merge_candidate_lists(*candidate_lists):
+    merged = {}
+    for candidates in candidate_lists:
+        for cand in candidates:
+            sid = cand["sid"]
+            prev = merged.get(sid)
+            if prev is None or candidate_rank_key(cand) > candidate_rank_key(prev):
+                merged[sid] = dict(cand)
+            elif prev is not None:
+                for field in ("aggregate_score", "fact_score", "coverage_score", "direct_support_score", "bridge_support_score", "semantic_relevance"):
+                    prev[field] = max(float(prev.get(field, 0.0)), float(cand.get(field, 0.0)))
+                merged[sid] = prev
+    return sorted(merged.values(), key=candidate_rank_key, reverse=True)
+
+
+def retrieve_one_fact(
+    fact,
+    claim_entry_s,
+    claim_entry_n,
+    context,
+    sentence_bank,
+    graph,
+    biencoder,
+    crossencoder,
+    nlp,
+    parent_results,
+    fact_stats,
+    args,
+):
+    critical = bool(fact.get("critical"))
+    critical_bonus = args.critical_bonus if critical else 0.0
+    profile = build_fact_profile(fact, nlp, context["entity_nodes"], context["relation_nodes"])
+    fact_role = infer_fact_role(fact, profile, fact_stats)
+    fact["role"] = fact_role
+    profile["fact_role"] = fact_role
+
+    entry_k_s = args.critical_fact_k if critical else args.fact_k
+    candidate_k = get_role_candidate_budget(fact_role, critical, args)
+    base_entry_s = topk_normalize(semantic_entry_from_bank(biencoder, fact["text"], sentence_bank, topk=entry_k_s), entry_k_s)
+    lexical_entry_s = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="base", topk=max(entry_k_s, candidate_k * 2))
+    constraint_entry_s = build_constraint_entry(profile, biencoder, sentence_bank, topk=max(args.constraint_k, candidate_k))
+    dependency_entry_s = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="bridge", topk=max(args.constraint_k, candidate_k)) if parent_results or fact_role == "bridge" else {}
+
+    dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
+    entry_s = merge_score_maps(
+        (args.initial_dense_weight, base_entry_s),
+        (args.initial_lexical_weight, lexical_entry_s),
+        (args.constraint_entry_weight, constraint_entry_s),
+        (args.initial_dependency_sentence_weight, dependency_entry_s),
+    )
+    entry_n = merge_score_maps((1.0, profile["entry_n"]), (args.dependency_seed_weight, dep_entry_n))
+    entry_r = merge_score_maps((1.0, profile["entry_r"]), (args.dependency_seed_weight, dep_entry_r))
+
+    if not entry_s:
+        entry_s = dict(sorted(claim_entry_s.items(), key=lambda x: x[1], reverse=True)[:entry_k_s])
+    if not entry_n:
+        entry_n = claim_entry_n
+
+    local_candidates = select_sentence_candidates(
+        context,
+        entry_s,
+        topk=candidate_k,
+        component_maps={
+            "dense_score": base_entry_s,
+            "lexical_score": lexical_entry_s,
+            "constraint_score": constraint_entry_s,
+            "dependency_score": dependency_entry_s,
+            "ppr_score": {},
+        },
+    )
+    if fact_role == "anchor":
+        local_candidates = filter_anchor_candidates(local_candidates, profile, context, args)
+
+    reranked = rerank_cross_encoder(crossencoder, fact["text"], local_candidates)
+    scored = enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, context, args, critical_bonus)
+    coverage_summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored, args)
+
+    expanded = False
+    repair_scored = []
+    if coverage_summary["needs_direct_repair"]:
+        expanded = True
+        direct_repair_candidates = build_targeted_direct_repair_candidates(
+            fact,
+            profile,
+            fact_role,
+            context,
+            sentence_bank,
+            biencoder,
+            parent_results,
+            args,
+        )
+        if direct_repair_candidates:
+            direct_reranked = rerank_cross_encoder(crossencoder, fact["text"], direct_repair_candidates)
+            repair_scored.extend(enrich_fact_candidates(fact, profile, fact_role, direct_reranked, parent_results, context, args, critical_bonus))
+
+    if coverage_summary["needs_bridge_repair"]:
+        expanded = True
+        bridge_repair_candidates = build_targeted_bridge_repair_candidates(
+            fact,
+            profile,
+            fact_role,
+            claim_entry_s,
+            claim_entry_n,
+            context,
+            sentence_bank,
+            graph,
+            scored,
+            parent_results,
+            biencoder,
+            args,
+        )
+        if bridge_repair_candidates:
+            bridge_reranked = rerank_cross_encoder(crossencoder, fact["text"], bridge_repair_candidates)
+            repair_scored.extend(enrich_fact_candidates(fact, profile, fact_role, bridge_reranked, parent_results, context, args, critical_bonus))
+
+    if repair_scored:
+        scored = merge_candidate_lists(scored, repair_scored)
+        coverage_summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored, args)
+
+    support_seed_candidates = coverage_summary["support_seed_candidates"] if coverage_summary["support_seed_candidates"] else scored
+    return {
+        "fact_id": fact["id"],
+        "text": fact["text"],
+        "role": fact_role,
+        "rely_on": fact.get("rely_on", []),
+        "critical": critical,
+        "constraint": fact.get("constraint", {}),
+        "expanded": expanded,
+        "entry_s": entry_s,
+        "entry_n": entry_n,
+        "entry_r": entry_r,
+        "fact_profile": profile,
+        "coverage_summary": coverage_summary,
+        "support_profile": build_support_profile(support_seed_candidates, context, max_candidates=args.parent_support_k),
+        "candidates": scored[:args.per_fact_output_k],
+    }

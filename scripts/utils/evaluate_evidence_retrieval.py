@@ -309,7 +309,7 @@ def pretty_print(results: Dict[str, Any]):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gold_path', type=str, default='data/[PLAN]/gold_evidence_dev.json')
+    parser.add_argument('--gold_path', type=str, default='data/plan4.2/gold_evidence_dev.json')
     parser.add_argument('--pred_path', type=str, default='data/[PLAN]/nodefc_decomposition_aware_dev_0_4000_pred_evidence.json')
     parser.add_argument('--save_path', type=str, default='data/[PLAN]/hover_eval_results.json')
     parser.add_argument('--plan', type=str, default='plan4.3')
