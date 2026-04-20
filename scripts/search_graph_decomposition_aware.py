@@ -1039,6 +1039,75 @@ def candidate_rank_key(candidate):
     )
 
 
+def score_fact_completeness_penalty(candidate_features, fact_role, args):
+    penalty = 0.0
+
+    entity_pair = float(candidate_features.get("entity_pair_score", 0.0))
+    relation_match = float(candidate_features.get("relation_match_score", 0.0))
+    binding_satisfied = bool(candidate_features.get("binding_satisfied", False))
+    context_independence = float(candidate_features.get("context_independence", 0.0))
+
+    if entity_pair < args.penalty_entity_pair_floor:
+        penalty += args.penalty_entity_pair_weight * (args.penalty_entity_pair_floor - entity_pair)
+    if relation_match <= 0.0:
+        penalty += args.penalty_relation_zero_weight
+    if not binding_satisfied:
+        penalty += args.penalty_binding_unsatisfied_weight
+    if context_independence < args.penalty_context_independent_floor:
+        penalty += args.penalty_context_independent_weight * (
+            args.penalty_context_independent_floor - context_independence
+        )
+
+    if fact_role == "verify":
+        penalty *= args.verify_penalty_boost
+    elif fact_role == "anchor":
+        penalty *= args.anchor_penalty_boost
+    return float(max(0.0, penalty))
+
+
+def compute_direct_support_pass(
+    fact,
+    profile,
+    fact_role,
+    cand,
+    relation_match,
+    entity_pair,
+    target_match,
+    keyword_overlap,
+    constraint_consistency,
+    negation_compatibility,
+    context_independence,
+    binding,
+    direct_support_score,
+    args,
+):
+    threshold = get_direct_support_threshold(fact_role, args)
+
+    completeness_ok = (
+        entity_pair >= args.min_entity_pair_for_direct
+        and relation_match >= args.min_relation_match_for_direct
+        and bool(binding.get("direct_hit") or binding.get("score", 0.0) >= args.binding_threshold)
+        and negation_compatibility >= args.min_negation_compat_for_direct
+        and context_independence >= args.min_context_independence_for_direct
+    )
+
+    if fact_role == "anchor" and (profile["numbers"] or profile["time_tokens"] or profile["quantity_tokens"]):
+        completeness_ok = completeness_ok and constraint_consistency >= args.min_constraint_consistency_for_anchor
+
+    if fact_role == "verify" and fact.get("critical"):
+        completeness_ok = completeness_ok and keyword_overlap >= args.min_keyword_overlap_for_critical_direct
+
+    return bool(direct_support_score >= threshold and completeness_ok)
+
+
+def compute_fact_covered_hard(fact, fact_role, has_direct_support, dependency_closure_ready):
+    if fact_role in {"verify", "anchor"}:
+        return bool(has_direct_support and dependency_closure_ready)
+    if requires_direct_support(fact_role, fact):
+        return bool(has_direct_support and dependency_closure_ready)
+    return bool(dependency_closure_ready)
+
+
 def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, context, args, critical_bonus):
     if not reranked:
         return []
@@ -1102,11 +1171,22 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             + 0.10 * ppr_norm
         )
 
-        direct_support_pass = direct_support_score >= direct_threshold and (
-            relation_match >= args.min_direct_relation_score or entity_pair >= 0.60 or target_match >= 0.55
+        direct_support_pass = compute_direct_support_pass(
+            fact=fact,
+            profile=profile,
+            fact_role=fact_role,
+            cand=cand,
+            relation_match=relation_match,
+            entity_pair=entity_pair,
+            target_match=target_match,
+            keyword_overlap=keyword_overlap,
+            constraint_consistency=constraint_consistency,
+            negation_compatibility=negation_compatibility,
+            context_independence=context_independence,
+            binding=binding,
+            direct_support_score=direct_support_score,
+            args=args,
         )
-        if fact_role == "anchor" and (profile["numbers"] or profile["time_tokens"] or profile["quantity_tokens"]):
-            direct_support_pass = direct_support_pass and constraint_consistency >= args.anchor_prefilter_threshold
 
         bridge_support_pass = bridge_support_score >= args.bridge_threshold or bridge["satisfied"] or binding["score"] >= args.binding_threshold
         dependency_closure_ready = (
@@ -1116,18 +1196,28 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             or bridge["satisfied"]
             or bridge["score"] >= args.bridge_threshold
         )
-        support_type = "direct_support" if direct_support_score >= max(direct_threshold - 0.05, bridge_support_score) else "bridge_support"
+
+        binding_satisfied = bool(binding["direct_hit"] or binding["score"] >= args.binding_threshold)
+        completeness_penalty = score_fact_completeness_penalty({
+            "entity_pair_score": entity_pair,
+            "relation_match_score": relation_match,
+            "binding_satisfied": binding_satisfied,
+            "context_independence": context_independence,
+        }, fact_role, args)
+
+        support_type = "direct_support" if direct_support_pass else ("bridge_support" if bridge_support_pass else "candidate")
 
         fact_score = clamp_score(
-            0.58 * direct_support_score
-            + 0.18 * max(0.0, constraint_consistency)
-            + 0.12 * context_independence
+            0.62 * direct_support_score
+            + 0.16 * max(0.0, constraint_consistency)
+            + 0.10 * context_independence
             + 0.12 * max(0.0, negation_compatibility)
+            - args.fact_completeness_penalty_weight * completeness_penalty
         )
         aggregate_score = (
-            1.45 * direct_support_score
+            1.55 * direct_support_score
             + 0.60 * ce_norm
-            + 0.25 * lexical_norm
+            + 0.22 * lexical_norm
             + 0.18 * dense_norm
             + (0.30 if fact_role == "anchor" else 0.18) * max(0.0, constraint_consistency)
             + 0.12 * max(0.0, negation_compatibility)
@@ -1137,8 +1227,13 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             + args.doc_rank_weight * doc_rank_bonus
             + critical_bonus
             - 0.20 * background_penalty
+            - args.fact_completeness_penalty_weight * completeness_penalty
         )
-        coverage_score = 0.68 * direct_support_score + 0.20 * bridge_support_score + 0.12 * max(0.0, constraint_consistency)
+        coverage_score = 0.74 * direct_support_score + 0.16 * bridge_support_score + 0.10 * max(0.0, constraint_consistency)
+
+        if fact_role == "verify" and not direct_support_pass:
+            aggregate_score -= args.verify_no_direct_support_margin
+            fact_score = max(0.0, fact_score - 0.5 * args.verify_no_direct_support_margin)
 
         if requires_direct_support(fact_role, fact):
             coverage_gate_pass = direct_support_pass and parents_covered and dependency_closure_ready
@@ -1163,66 +1258,77 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             "doc_rank_bonus": float(doc_rank_bonus),
             "fact_score": float(fact_score),
             "binding_score": float(binding["score"]),
-            "binding_satisfied": bool(binding["direct_hit"] or binding["score"] >= args.binding_threshold),
+            "binding_satisfied": bool(binding_satisfied),
             "bridge_score": float(bridge["score"]),
             "bridge_satisfied": bool(bridge["satisfied"] or bridge["score"] >= args.bridge_threshold),
             "bridge_support_score": float(bridge_support_score),
             "bridge_support_pass": bool(bridge_support_pass),
             "direct_support_score": float(direct_support_score),
             "direct_support_pass": bool(direct_support_pass),
+            "direct_threshold": float(direct_threshold),
             "dependency_closure_ready": bool(dependency_closure_ready),
             "support_type": support_type,
             "cross_doc_bridge_score": float(bridge["cross_doc"]),
             "coverage_score": float(coverage_score),
             "aggregate_score": float(aggregate_score),
             "coverage_gate_pass": bool(coverage_gate_pass),
+            "fact_completeness_penalty": float(completeness_penalty),
         })
         scored.append(item)
 
     scored.sort(key=candidate_rank_key, reverse=True)
     return scored
 
-
 def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args):
     parent_covered = all((parent.get("coverage_summary") or {}).get("covered", False) for parent in parent_results)
     direct_candidates = sorted([cand for cand in scored_candidates if cand.get("direct_support_pass")], key=candidate_rank_key, reverse=True)
     bridge_candidates = sorted([cand for cand in scored_candidates if cand.get("bridge_support_pass")], key=candidate_rank_key, reverse=True)
     requires_direct = requires_direct_support(fact_role, fact)
-    dependency_closure = (not fact.get("rely_on")) or any(cand.get("dependency_closure_ready") for cand in direct_candidates) or any(cand.get("bridge_support_pass") for cand in bridge_candidates)
-    coverage_candidates = direct_candidates if requires_direct else (direct_candidates or bridge_candidates)
-    need = args.critical_min_per_fact if fact.get("critical") else args.default_min_per_fact
-    support_seed_candidates = list(direct_candidates)
+
+    dependency_closure = (not fact.get("rely_on")) or any(cand.get("dependency_closure_ready") for cand in direct_candidates)
+    hard_has_direct = bool(direct_candidates)
+    covered = compute_fact_covered_hard(
+        fact=fact,
+        fact_role=fact_role,
+        has_direct_support=hard_has_direct,
+        dependency_closure_ready=bool(parent_covered and dependency_closure),
+    )
+
+    best_candidate = scored_candidates[0] if scored_candidates else None
+    best_direct = direct_candidates[0] if direct_candidates else None
+    best_bridge = bridge_candidates[0] if bridge_candidates else None
+
+    direct_winners = direct_candidates[:1]
+    critical_backups = direct_candidates[1:2] if fact.get("critical") else []
+    support_seed_candidates = list(direct_winners + critical_backups)
     seen_sids = {cand["sid"] for cand in support_seed_candidates}
     for cand in bridge_candidates:
         if cand["sid"] not in seen_sids:
             support_seed_candidates.append(cand)
             seen_sids.add(cand["sid"])
 
-    best_candidate = scored_candidates[0] if scored_candidates else None
-    best_direct = direct_candidates[0] if direct_candidates else None
-    best_bridge = bridge_candidates[0] if bridge_candidates else None
-    covered = bool(parent_covered and coverage_candidates and dependency_closure and len(coverage_candidates) >= need)
     return {
-        "covered": bool(covered),
+        "covered": bool(parent_covered and covered),
         "parent_covered": bool(parent_covered),
         "requires_direct_support": bool(requires_direct),
-        "has_direct_support": bool(direct_candidates),
+        "has_direct_support": bool(hard_has_direct),
         "dependency_closure": bool(dependency_closure),
-        "needs_direct_repair": not bool(direct_candidates),
-        "needs_bridge_repair": bool(fact.get("rely_on")) and bool(parent_covered) and not bool(dependency_closure),
+        "needs_direct_repair": bool(requires_direct and not direct_candidates),
+        "needs_bridge_repair": bool(fact.get("rely_on")) and bool(parent_covered) and bool(direct_candidates) and not bool(dependency_closure),
         "top_fact_score": float(best_candidate["fact_score"]) if best_candidate else 0.0,
         "top_direct_support_score": float(best_direct["direct_support_score"]) if best_direct else 0.0,
         "top_bridge_support_score": float(best_bridge["bridge_support_score"]) if best_bridge else 0.0,
-        "num_coverage_candidates": len(coverage_candidates),
+        "num_coverage_candidates": len(direct_candidates),
         "num_direct_candidates": len(direct_candidates),
         "num_bridge_candidates": len(bridge_candidates),
         "best_direct_sid": best_direct["sid"] if best_direct else None,
         "best_bridge_sid": best_bridge["sid"] if best_bridge else None,
         "direct_candidates": direct_candidates,
         "bridge_candidates": bridge_candidates,
+        "direct_winners": direct_winners,
+        "critical_backups": critical_backups,
         "support_seed_candidates": support_seed_candidates,
     }
-
 
 def coverage_insufficient(fact, fact_role, parent_results, scored_candidates, args):
     summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args)
@@ -1683,14 +1789,16 @@ def score_bridge_against_selected_sids(sid, selected_parent_sids, context, seman
 
 def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stats, context, semantic_sim_map, doc_budget, args):
     selected_sids = list(selected_sids)
+    selected_sid_set = set(selected_sids)
     selected_docs = {sentence_pool[sid]["docid"] for sid in selected_sids if sentence_pool[sid].get("docid")}
+
     fact_direct_candidates = defaultdict(list)
     fact_bridge_candidates = defaultdict(list)
     for sid in selected_sids:
         for fact_id, support in sentence_pool[sid]["fact_support"].items():
-            if support.get("support_type") == "direct_support":
+            if support.get("direct_support_pass"):
                 fact_direct_candidates[fact_id].append((sid, support))
-            else:
+            if support.get("bridge_support_pass"):
                 fact_bridge_candidates[fact_id].append((sid, support))
 
     ordered_facts = sorted(
@@ -1716,10 +1824,28 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
         }
 
     def sort_direct(items):
-        return sorted(items, key=lambda x: (float(x[1].get("direct_support_score", 0.0)), float(x[1].get("fact_score", 0.0)), float(x[1].get("aggregate_score", 0.0))), reverse=True)
+        return sorted(
+            items,
+            key=lambda x: (
+                float(x[1].get("direct_support_score", 0.0)),
+                float(x[1].get("fact_score", 0.0)),
+                -float(x[1].get("fact_completeness_penalty", 0.0)),
+                float(x[1].get("aggregate_score", 0.0)),
+            ),
+            reverse=True,
+        )
 
     def sort_bridge(items):
-        return sorted(items, key=lambda x: (float(x[1].get("bridge_support_score", 0.0)), float(x[1].get("aggregate_score", 0.0)), float(x[1].get("fact_score", 0.0))), reverse=True)
+        return sorted(
+            items,
+            key=lambda x: (
+                float(x[1].get("bridge_support_score", 0.0)),
+                float(x[1].get("binding_score", 0.0)),
+                float(x[1].get("aggregate_score", 0.0)),
+                float(x[1].get("fact_score", 0.0)),
+            ),
+            reverse=True,
+        )
 
     for fact in ordered_facts:
         fid = fact["id"]
@@ -1729,28 +1855,32 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
             continue
 
         parent_witness_sids = [fact_witnesses[pid]["sid"] for pid in parents if pid in fact_witnesses]
-        direct_candidates = sort_direct([item for item in fact_direct_candidates.get(fid, []) if item[1].get("direct_support_pass")])
+        all_direct_candidates = sort_direct([item for item in fact_direct_candidates.get(fid, []) if item[1].get("direct_support_pass")])
         bridge_candidates = sort_bridge([item for item in fact_bridge_candidates.get(fid, []) if item[1].get("bridge_support_pass")])
-        requires_direct = requires_direct_support(fact_role, fact)
+
+        direct_candidates = []
+        for sid, support in all_direct_candidates:
+            if sid in selected_sid_set:
+                direct_candidates.append((sid, support))
+            elif sid in {cand_sid for cand_sid, _ in bridge_candidates}:
+                direct_candidates.append((sid, support))
+        if not direct_candidates:
+            direct_candidates = all_direct_candidates
+
+        direct_winners = direct_candidates[:1]
+        if fact.get("critical"):
+            direct_winners = direct_candidates[:2]
 
         witness_sid = None
         witness_support = None
         witness_bridge_eval = zero_bridge_eval()
-        for sid, support in direct_candidates:
+
+        for sid, support in direct_winners:
             bridge_eval = zero_bridge_eval() if not parents else score_bridge_against_selected_sids(sid, parent_witness_sids, context, semantic_sim_map, args)
-            if not parents or support.get("dependency_closure_ready") or bridge_eval["satisfied"] or bridge_eval["score"] >= args.bridge_threshold:
-                witness_sid = sid
-                witness_support = support
-                witness_bridge_eval = bridge_eval
-                break
-
-        if witness_sid is None and direct_candidates:
-            witness_sid, witness_support = direct_candidates[0]
-            witness_bridge_eval = zero_bridge_eval() if not parents else score_bridge_against_selected_sids(witness_sid, parent_witness_sids, context, semantic_sim_map, args)
-
-        if witness_sid is None and not requires_direct and bridge_candidates:
-            witness_sid, witness_support = bridge_candidates[0]
-            witness_bridge_eval = zero_bridge_eval() if not parents else score_bridge_against_selected_sids(witness_sid, parent_witness_sids, context, semantic_sim_map, args)
+            witness_sid = sid
+            witness_support = support
+            witness_bridge_eval = bridge_eval
+            break
 
         if witness_sid is None:
             continue
@@ -1762,7 +1892,7 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
         if parents:
             dependency_ready = bool(witness_support.get("dependency_closure_ready") or witness_bridge_eval["satisfied"] or witness_bridge_eval["score"] >= args.bridge_threshold)
             if not dependency_ready:
-                helper_candidates = bridge_candidates + [item for item in direct_candidates if item[0] != witness_sid]
+                helper_candidates = bridge_candidates
                 seen_helpers = set()
                 for sid, support in helper_candidates:
                     if sid in seen_helpers or sid == witness_sid:
@@ -1776,7 +1906,14 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
                         dependency_ready = True
                         break
 
-        if not dependency_ready:
+        has_direct_support = bool(witness_support and witness_support.get("direct_support_pass"))
+        hard_covered = compute_fact_covered_hard(
+            fact=fact,
+            fact_role=fact_role,
+            has_direct_support=has_direct_support,
+            dependency_closure_ready=dependency_ready,
+        )
+        if not hard_covered:
             continue
 
         covered_facts.add(fid)
@@ -1839,6 +1976,7 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
         "redundancy": float(redundancy),
     }
 
+
 def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, semantic_sim_map, args):
     sentence_pool = build_sentence_support_pool(fact_results, topk_per_fact=args.assembly_candidates_per_fact)
     if not sentence_pool:
@@ -1856,47 +1994,101 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
 
     doc_budget, budget_summary = compute_dynamic_doc_budget(fact_sequence, fact_stats, sentence_pool, args)
 
-    def sentence_rank(item):
-        direct_max = max((support.get("direct_support_score", 0.0) for support in item[1]["fact_support"].values()), default=0.0)
-        return (direct_max, item[1]["best_fact_score"], item[1]["score"])
-
-    ranked_sids = [sid for sid, _ in sorted(sentence_pool.items(), key=sentence_rank, reverse=True)]
-
-    selected_sids = []
-    state = evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stats, context, semantic_sim_map, doc_budget, args)
-    while len(selected_sids) < args.max_evidence:
-        best_sid = None
-        best_state = None
-        best_gain = args.assembly_stop_gain
-        current_docids = set(state["docids"])
-
-        for sid in ranked_sids:
-            if sid in selected_sids:
-                continue
-            docid = sentence_pool[sid].get("docid")
-            if docid and docid not in current_docids and len(current_docids) >= doc_budget:
-                continue
-
-            candidate_state = evaluate_selected_set(selected_sids + [sid], sentence_pool, fact_sequence, fact_stats, context, semantic_sim_map, doc_budget, args)
-            gain = candidate_state["utility"] - state["utility"]
-            if gain > best_gain:
-                best_sid = sid
-                best_state = candidate_state
-                best_gain = gain
-
-        if best_sid is None:
-            break
-        selected_sids.append(best_sid)
-        state = best_state
-
-    if not selected_sids and ranked_sids:
-        selected_sids = [ranked_sids[0]]
-        state = evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stats, context, semantic_sim_map, doc_budget, args)
-
     fact_coverage = defaultdict(list)
-    for sid in selected_sids:
-        for fact_id in state["facts_by_sid"].get(sid, []):
-            fact_coverage[fact_id].append(sid)
+    selected_sids = []
+    selected_sid_set = set()
+    selected_docids = set()
+    covered_facts = set()
+    fact_witnesses = {}
+    facts_by_sid = defaultdict(list)
+
+    ordered_facts = sorted(
+        fact_sequence,
+        key=lambda fact: (fact_stats["depth_map"].get(fact["id"], 1), 0 if fact.get("critical") else 1),
+    )
+
+    if isinstance(fact_results, dict):
+        result_by_id = fact_results
+    else:
+        result_by_id = {}
+        for fr in fact_results:
+            if isinstance(fr, dict) and "fact_id" in fr:
+                result_by_id[fr["fact_id"]] = fr
+
+    for fact in ordered_facts:
+        fid = fact["id"]
+        fr = result_by_id.get(fid) or {}
+        summary = fr.get("coverage_summary") or {}
+        direct_candidates = list(summary.get("direct_candidates") or [])
+        if not direct_candidates:
+            continue
+
+        keep = 2 if fact.get("critical") else 1
+        chosen_direct = []
+        for cand in direct_candidates:
+            sid = cand["sid"]
+            docid = sentence_pool.get(sid, {}).get("docid")
+            if docid and docid not in selected_docids and len(selected_docids) >= doc_budget:
+                continue
+            if sid not in selected_sid_set:
+                selected_sids.append(sid)
+                selected_sid_set.add(sid)
+                if docid:
+                    selected_docids.add(docid)
+            chosen_direct.append(cand)
+            if len(chosen_direct) >= keep:
+                break
+
+        if not chosen_direct:
+            continue
+
+        witness = chosen_direct[0]
+        dependency_ready = not fact.get("rely_on")
+        helper = None
+        if fact.get("rely_on"):
+            parent_sids = [fact_witnesses[pid]["sid"] for pid in fact.get("rely_on", []) if pid in fact_witnesses]
+            if parent_sids:
+                bridge_eval = score_bridge_against_selected_sids(witness["sid"], parent_sids, context, semantic_sim_map, args)
+                dependency_ready = bool(witness.get("dependency_closure_ready") or bridge_eval["satisfied"] or bridge_eval["score"] >= args.bridge_threshold)
+                if not dependency_ready:
+                    for bc in summary.get("bridge_candidates") or []:
+                        sid = bc["sid"]
+                        if sid == witness["sid"]:
+                            continue
+                        docid = sentence_pool.get(sid, {}).get("docid")
+                        if docid and docid not in selected_docids and len(selected_docids) >= doc_budget:
+                            continue
+                        bridge_eval = score_bridge_against_selected_sids(sid, parent_sids, context, semantic_sim_map, args)
+                        if bc.get("bridge_support_pass") or bridge_eval["satisfied"] or bridge_eval["score"] >= args.bridge_threshold:
+                            helper = bc
+                            dependency_ready = True
+                            if sid not in selected_sid_set:
+                                selected_sids.append(sid)
+                                selected_sid_set.add(sid)
+                                if docid:
+                                    selected_docids.add(docid)
+                            break
+
+        has_direct_support = bool(witness.get("direct_support_pass"))
+        if not compute_fact_covered_hard(fact, fact.get("role", "verify"), has_direct_support, dependency_ready):
+            continue
+
+        covered_facts.add(fid)
+        fact_witnesses[fid] = {
+            "sid": witness["sid"],
+            "helper_sid": None if helper is None else helper["sid"],
+            "fact_score": float(witness.get("fact_score", 0.0)),
+            "direct_support_score": float(witness.get("direct_support_score", 0.0)),
+            "bridge_score": float(0.0 if helper is None else helper.get("bridge_support_score", 0.0)),
+            "cross_doc_bridge": float(0.0 if helper is None else helper.get("cross_doc_bridge_score", 0.0)),
+        }
+        facts_by_sid[witness["sid"]].append(fid)
+        fact_coverage[fid].append(witness["sid"])
+        if helper is not None:
+            facts_by_sid[helper["sid"]].append(fid)
+            fact_coverage[fid].append(helper["sid"])
+
+    state = evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stats, context, semantic_sim_map, doc_budget, args)
 
     selected = []
     for sid in selected_sids:
@@ -1976,7 +2168,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             "coverage_score": float(coverage_score),
             "supporting_facts": supporting_facts,
             "support_details": support_details,
-            "selection_stage": "set_gain",
+            "selection_stage": "hard_two_stage",
         })
 
     selected.sort(key=lambda x: (1 if x.get("support_type") == "direct_support" else 0, float(x.get("direct_support_score", 0.0)), float(x.get("fact_score", 0.0)), float(x.get("score", 0.0))), reverse=True)
@@ -1990,6 +2182,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
         "dependency_covered": int(state["dependency_covered"]),
         "cross_doc_bridge_count": int(state["cross_doc_bridge_count"]),
         "redundancy": float(state["redundancy"]),
+        "selection_mode": "hard_two_stage",
     })
     return selected, dict(fact_coverage), assembly_summary
 
@@ -2205,6 +2398,22 @@ if __name__ == "__main__":
     parser.add_argument("--anchor_direct_support_threshold", type=float, default=0.60)
     parser.add_argument("--bridge_direct_support_threshold", type=float, default=0.52)
     parser.add_argument("--min_direct_relation_score", type=float, default=0.16)
+    parser.add_argument("--min_entity_pair_for_direct", type=float, default=0.45)
+    parser.add_argument("--min_relation_match_for_direct", type=float, default=0.16)
+    parser.add_argument("--min_negation_compat_for_direct", type=float, default=0.00)
+    parser.add_argument("--min_context_independence_for_direct", type=float, default=0.18)
+    parser.add_argument("--min_constraint_consistency_for_anchor", type=float, default=0.20)
+    parser.add_argument("--min_keyword_overlap_for_critical_direct", type=float, default=0.05)
+    parser.add_argument("--fact_completeness_penalty_weight", type=float, default=0.18)
+    parser.add_argument("--penalty_entity_pair_floor", type=float, default=0.45)
+    parser.add_argument("--penalty_entity_pair_weight", type=float, default=0.30)
+    parser.add_argument("--penalty_relation_zero_weight", type=float, default=0.35)
+    parser.add_argument("--penalty_binding_unsatisfied_weight", type=float, default=0.25)
+    parser.add_argument("--penalty_context_independent_floor", type=float, default=0.40)
+    parser.add_argument("--penalty_context_independent_weight", type=float, default=0.20)
+    parser.add_argument("--verify_penalty_boost", type=float, default=1.20)
+    parser.add_argument("--anchor_penalty_boost", type=float, default=1.05)
+    parser.add_argument("--verify_no_direct_support_margin", type=float, default=0.40)
     parser.add_argument("--anchor_prefilter_threshold", type=float, default=0.00)
     parser.add_argument("--default_min_per_fact", type=int, default=1)
     parser.add_argument("--critical_min_per_fact", type=int, default=2)
