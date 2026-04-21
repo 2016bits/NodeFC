@@ -5,7 +5,7 @@ import numpy as np
 from search_graph_hopaware import make_personalization, norm_text, ppr
 
 from search_graph_decomposition_aware_modules.scoring import (
-    compute_direct_support_pass,
+    compute_direct_support_tier,
     score_background_penalty,
     score_binding_coverage,
     score_bridge_features,
@@ -285,7 +285,15 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             + 0.10 * ppr_norm
         )
 
-        direct_support_pass = compute_direct_support_pass(
+        bridge_support_pass = bridge_support_score >= args.bridge_threshold or bridge["satisfied"] or binding["score"] >= args.binding_threshold
+        dependency_closure_ready = (
+            not fact.get("rely_on")
+            or binding["direct_hit"]
+            or binding["score"] >= args.binding_threshold
+            or bridge["satisfied"]
+            or bridge["score"] >= args.bridge_threshold
+        )
+        direct_support_tier = compute_direct_support_tier(
             fact=fact,
             profile=profile,
             fact_role=fact_role,
@@ -299,17 +307,14 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             context_independence=context_independence,
             binding=binding,
             direct_support_score=direct_support_score,
+            bridge_support_pass=bridge_support_pass,
+            dependency_closure_ready=dependency_closure_ready,
             args=args,
         )
-
-        bridge_support_pass = bridge_support_score >= args.bridge_threshold or bridge["satisfied"] or binding["score"] >= args.binding_threshold
-        dependency_closure_ready = (
-            not fact.get("rely_on")
-            or binding["direct_hit"]
-            or binding["score"] >= args.binding_threshold
-            or bridge["satisfied"]
-            or bridge["score"] >= args.bridge_threshold
-        )
+        direct_support_pass = direct_support_tier != "none"
+        strong_direct_support_pass = direct_support_tier == "strong"
+        weak_direct_support_pass = direct_support_tier == "weak"
+        bridge_assisted_direct_pass = direct_support_tier == "bridge_assisted"
 
         binding_satisfied = bool(binding["direct_hit"] or binding["score"] >= args.binding_threshold)
         completeness_penalty = score_fact_completeness_penalty({
@@ -345,14 +350,26 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
         )
         coverage_score = 0.74 * direct_support_score + 0.16 * bridge_support_score + 0.10 * max(0.0, constraint_consistency)
 
-        if fact_role == "verify" and not direct_support_pass:
-            aggregate_score -= args.verify_no_direct_support_margin
-            fact_score = max(0.0, fact_score - 0.5 * args.verify_no_direct_support_margin)
+        if fact_role == "verify":
+            if direct_support_tier == "none":
+                aggregate_score -= args.verify_no_direct_support_margin
+                fact_score = max(0.0, fact_score - 0.5 * args.verify_no_direct_support_margin)
+            elif direct_support_tier == "bridge_assisted":
+                aggregate_score -= 0.35 * args.verify_no_direct_support_margin
+            elif direct_support_tier == "weak":
+                aggregate_score -= 0.15 * args.verify_no_direct_support_margin
 
-        if requires_direct_support(fact_role, fact):
-            coverage_gate_pass = direct_support_pass and parents_covered and dependency_closure_ready
-        else:
-            coverage_gate_pass = parents_covered and ((direct_support_pass and dependency_closure_ready) or bridge_support_pass)
+        candidate_coverage = compute_fact_coverage_status(
+            fact=fact,
+            fact_role=fact_role,
+            has_direct_support=bool(direct_support_pass),
+            dependency_closure_ready=bool(parents_covered and dependency_closure_ready),
+            has_bridge_support=bool(bridge_support_pass),
+            has_strong_direct_support=bool(strong_direct_support_pass),
+            has_weak_direct_support=bool(weak_direct_support_pass),
+            has_bridge_assisted_direct=bool(bridge_assisted_direct_pass),
+        )
+        coverage_gate_pass = bool(parents_covered and candidate_coverage["fully_covered"])
 
         item = dict(cand)
         item.update({
@@ -379,6 +396,10 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             "bridge_support_pass": bool(bridge_support_pass),
             "direct_support_score": float(direct_support_score),
             "direct_support_pass": bool(direct_support_pass),
+            "direct_support_tier": direct_support_tier,
+            "strong_direct_support_pass": bool(strong_direct_support_pass),
+            "weak_direct_support_pass": bool(weak_direct_support_pass),
+            "bridge_assisted_direct_pass": bool(bridge_assisted_direct_pass),
             "direct_threshold": float(direct_threshold),
             "dependency_closure_ready": bool(dependency_closure_ready),
             "support_type": support_type,
@@ -396,12 +417,32 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
 
 def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args):
     parent_covered = all((parent.get("coverage_summary") or {}).get("covered", False) for parent in parent_results)
+    parent_summary = build_parent_support_summary(parent_results)
     direct_candidates = sorted([cand for cand in scored_candidates if cand.get("direct_support_pass")], key=candidate_rank_key, reverse=True)
+    strong_direct_candidates = [cand for cand in direct_candidates if cand.get("direct_support_tier") == "strong"]
+    weak_direct_candidates = [cand for cand in direct_candidates if cand.get("direct_support_tier") == "weak"]
+    bridge_assisted_direct_candidates = [cand for cand in direct_candidates if cand.get("direct_support_tier") == "bridge_assisted"]
     bridge_candidates = sorted([cand for cand in scored_candidates if cand.get("bridge_support_pass")], key=candidate_rank_key, reverse=True)
     has_direct_support = bool(direct_candidates)
+    has_strong_direct_support = bool(strong_direct_candidates)
+    has_weak_direct_support = bool(weak_direct_candidates)
+    has_bridge_assisted_direct = bool(bridge_assisted_direct_candidates)
     has_bridge_support = bool(bridge_candidates)
     dependency_closure = (not fact.get("rely_on")) or any(
         cand.get("dependency_closure_ready") for cand in (direct_candidates + bridge_candidates)
+    )
+    anchor_constraint_ready = fact_role != "anchor" or any(
+        cand.get("time_quantity_consistency", 0.0) >= args.min_constraint_consistency_for_anchor
+        for cand in direct_candidates
+    )
+    cross_doc_bridge_ready = bool(fact.get("rely_on")) and any(
+        cand.get("cross_doc_bridge_score", 0.0) > 0
+        and (
+            cand.get("bridge_support_pass")
+            or cand.get("dependency_closure_ready")
+            or cand.get("direct_support_pass")
+        )
+        for cand in (direct_candidates + bridge_candidates)
     )
     coverage_status = compute_fact_coverage_status(
         fact=fact,
@@ -409,6 +450,9 @@ def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidat
         has_direct_support=has_direct_support,
         dependency_closure_ready=bool(parent_covered and dependency_closure),
         has_bridge_support=has_bridge_support,
+        has_strong_direct_support=has_strong_direct_support,
+        has_weak_direct_support=has_weak_direct_support,
+        has_bridge_assisted_direct=has_bridge_assisted_direct,
     )
 
     best_candidate = scored_candidates[0] if scored_candidates else None
@@ -426,37 +470,60 @@ def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidat
             support_seed_candidates.append(cand)
             seen_sids.add(cand["sid"])
 
-    needs_direct_repair = bool(coverage_status["requires_direct_support"] and not has_direct_support)
-    if fact_role == "bridge":
-        needs_bridge_repair = bool(fact.get("rely_on")) and bool(parent_covered) and (
-            not coverage_status["covered"] or not coverage_status["fully_covered"]
-        )
-    else:
-        needs_bridge_repair = bool(fact.get("rely_on")) and bool(parent_covered) and bool(
-            coverage_status["support_ready"] and not coverage_status["fully_covered"]
-        )
+    covered = bool(parent_covered and coverage_status["covered"])
+    fully_covered = bool(parent_covered and coverage_status["fully_covered"])
+    needs_fact_completion = bool(
+        (not covered and not coverage_status["support_ready"])
+        or (coverage_status["requires_direct_support"] and not has_direct_support)
+        or (fact.get("critical") and not covered)
+    )
+    needs_critical_fact_completion = bool(fact.get("critical") and not covered)
+    needs_dependency_completion = bool(fact.get("rely_on")) and bool(parent_covered) and not bool(dependency_closure)
+    needs_cross_doc_bridge_completion = bool(fact.get("rely_on")) and bool(parent_covered) and not bool(cross_doc_bridge_ready) and bool(
+        not fully_covered or len(parent_summary["docids"]) > 1
+    )
+    needs_anchor_completion = bool(fact_role == "anchor" and not anchor_constraint_ready)
 
     return {
-        "covered": bool(parent_covered and coverage_status["covered"]),
-        "fully_covered": bool(parent_covered and coverage_status["fully_covered"]),
+        "covered": covered,
+        "fully_covered": fully_covered,
         "parent_covered": bool(parent_covered),
         "requires_direct_support": bool(coverage_status["requires_direct_support"]),
+        "relaxed_direct_allowed": bool(coverage_status["relaxed_direct_allowed"]),
         "support_ready": bool(coverage_status["support_ready"]),
         "closure_ready": bool(coverage_status["closure_ready"]),
         "has_direct_support": bool(has_direct_support),
+        "has_strong_direct_support": bool(has_strong_direct_support),
+        "has_weak_direct_support": bool(has_weak_direct_support),
+        "has_bridge_assisted_direct": bool(has_bridge_assisted_direct),
+        "best_direct_support_tier": (best_direct or {}).get("direct_support_tier", "none"),
         "has_bridge_support": bool(has_bridge_support),
         "dependency_closure": bool(dependency_closure),
-        "needs_direct_repair": bool(needs_direct_repair),
-        "needs_bridge_repair": bool(needs_bridge_repair),
+        "anchor_constraint_ready": bool(anchor_constraint_ready),
+        "cross_doc_bridge_ready": bool(cross_doc_bridge_ready),
+        "needs_fact_completion": bool(needs_fact_completion),
+        "needs_critical_fact_completion": bool(needs_critical_fact_completion),
+        "needs_dependency_completion": bool(needs_dependency_completion),
+        "needs_cross_doc_bridge_completion": bool(needs_cross_doc_bridge_completion),
+        "needs_anchor_completion": bool(needs_anchor_completion),
+        "needs_direct_repair": bool(needs_fact_completion),
+        "needs_bridge_repair": bool(needs_dependency_completion or needs_cross_doc_bridge_completion),
         "top_fact_score": float(best_candidate["fact_score"]) if best_candidate else 0.0,
         "top_direct_support_score": float(best_direct["direct_support_score"]) if best_direct else 0.0,
         "top_bridge_support_score": float(best_bridge["bridge_support_score"]) if best_bridge else 0.0,
+        "top_direct_support_tier": (best_direct or {}).get("direct_support_tier", "none"),
         "num_coverage_candidates": len(direct_candidates if coverage_status["requires_direct_support"] else bridge_candidates),
         "num_direct_candidates": len(direct_candidates),
+        "num_strong_direct_candidates": len(strong_direct_candidates),
+        "num_weak_direct_candidates": len(weak_direct_candidates),
+        "num_bridge_assisted_direct_candidates": len(bridge_assisted_direct_candidates),
         "num_bridge_candidates": len(bridge_candidates),
         "best_direct_sid": best_direct["sid"] if best_direct else None,
         "best_bridge_sid": best_bridge["sid"] if best_bridge else None,
         "direct_candidates": direct_candidates,
+        "strong_direct_candidates": strong_direct_candidates,
+        "weak_direct_candidates": weak_direct_candidates,
+        "bridge_assisted_direct_candidates": bridge_assisted_direct_candidates,
         "bridge_candidates": bridge_candidates,
         "direct_winners": direct_winners,
         "bridge_winners": bridge_winners,
@@ -466,7 +533,13 @@ def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidat
 
 def coverage_insufficient(fact, fact_role, parent_results, scored_candidates, args):
     summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args)
-    return not summary["fully_covered"] or summary["needs_direct_repair"] or summary["needs_bridge_repair"]
+    return bool(
+        not summary["fully_covered"]
+        or summary["needs_fact_completion"]
+        or summary["needs_dependency_completion"]
+        or summary["needs_cross_doc_bridge_completion"]
+        or summary["needs_anchor_completion"]
+    )
 
 
 def build_chain_bridge_sentence_map(binding_requirements, parent_results, context, args):
@@ -540,7 +613,7 @@ def build_chain_completion_entries(
     return dict(expanded_s), dict(expanded_n), dict(expanded_r)
 
 
-def build_targeted_direct_repair_candidates(
+def build_targeted_fact_completion_candidates(
     fact,
     profile,
     fact_role,
@@ -578,7 +651,7 @@ def build_targeted_direct_repair_candidates(
     return candidates
 
 
-def build_targeted_bridge_repair_candidates(
+def build_targeted_dependency_completion_candidates(
     fact,
     profile,
     fact_role,
@@ -636,6 +709,113 @@ def build_targeted_bridge_repair_candidates(
     if fact_role == "anchor":
         candidates = filter_anchor_candidates(candidates, profile, context, args)
     return candidates
+
+
+def build_targeted_cross_doc_bridge_candidates(
+    fact,
+    profile,
+    fact_role,
+    claim_entry_s,
+    claim_entry_n,
+    context,
+    sentence_bank,
+    graph,
+    scored_candidates,
+    parent_results,
+    biencoder,
+    args,
+):
+    if not parent_results:
+        return []
+
+    parent_summary = build_parent_support_summary(parent_results)
+    budget = args.bridge_repair_candidate_k
+    topk = max(budget * 2, args.chain_seed_k)
+    bridge_lexical = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="bridge", topk=topk)
+    query_text = build_bridge_repair_query_text(fact, profile, parent_results, context)
+    bridge_dense = topk_normalize(semantic_entry_from_bank(biencoder, query_text, sentence_bank, topk=topk), topk)
+
+    dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
+    exp_s, exp_n, exp_r = build_chain_completion_entries(
+        fact,
+        profile,
+        bridge_lexical,
+        merge_score_maps((1.0, profile["entry_n"]), (args.dependency_seed_weight, dep_entry_n)),
+        merge_score_maps((1.0, profile["entry_r"]), (args.dependency_seed_weight, dep_entry_r)),
+        scored_candidates,
+        claim_entry_s,
+        claim_entry_n,
+        parent_results,
+        context,
+        args,
+    )
+    exp_personalization = make_personalization(exp_s, exp_n, exp_r, w_s=args.w_entry_s, w_n=args.w_entry_n, w_r=args.w_entry_r)
+    ppr_scores = normalize_sentence_node_scores(ppr(graph, exp_personalization, alpha=args.ppr_alpha, max_iter=args.ppr_max_iter), topk)
+    cross_doc_bias = topk_normalize({
+        sid: 1.0
+        for sid in context["sid_list"]
+        if context["sid2meta"].get(sid, {}).get("docid")
+        and context["sid2meta"][sid]["docid"] not in parent_summary["docids"]
+    }, topk)
+    combined = merge_score_maps(
+        (args.bridge_repair_lexical_weight, bridge_lexical),
+        (args.bridge_repair_dense_weight, bridge_dense),
+        (args.ppr_expand_weight, ppr_scores),
+        (args.cross_doc_completion_weight, cross_doc_bias),
+    )
+    candidates = select_sentence_candidates(
+        context,
+        combined,
+        topk=budget * 2,
+        component_maps={
+            "dense_score": bridge_dense,
+            "lexical_score": bridge_lexical,
+            "constraint_score": {},
+            "dependency_score": bridge_lexical,
+            "ppr_score": ppr_scores,
+        },
+    )
+    cross_doc_candidates = [
+        cand for cand in candidates
+        if cand.get("docid") and cand["docid"] not in parent_summary["docids"]
+    ]
+    return cross_doc_candidates[:budget] if cross_doc_candidates else candidates[:budget]
+
+
+def build_targeted_anchor_completion_candidates(
+    fact,
+    profile,
+    fact_role,
+    context,
+    sentence_bank,
+    biencoder,
+    parent_results,
+    args,
+):
+    budget = max(args.anchor_candidate_k, args.direct_repair_candidate_k)
+    topk = max(budget * 2, args.constraint_k)
+    anchor_lexical = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="direct", topk=topk)
+    query_text = build_direct_repair_query_text(fact, profile, context)
+    anchor_dense = topk_normalize(semantic_entry_from_bank(biencoder, query_text, sentence_bank, topk=topk), topk)
+    constraint_entry = build_constraint_entry(profile, biencoder, sentence_bank, topk=topk)
+    combined = merge_score_maps(
+        (args.direct_repair_lexical_weight, anchor_lexical),
+        (args.direct_repair_dense_weight, anchor_dense),
+        (args.anchor_completion_weight, constraint_entry),
+    )
+    candidates = select_sentence_candidates(
+        context,
+        combined,
+        topk=budget,
+        component_maps={
+            "dense_score": anchor_dense,
+            "lexical_score": anchor_lexical,
+            "constraint_score": constraint_entry,
+            "dependency_score": {},
+            "ppr_score": {},
+        },
+    )
+    return filter_anchor_candidates(candidates, profile, context, args)
 
 
 def merge_recall_candidates(*candidate_lists):
@@ -754,10 +934,12 @@ def retrieve_one_fact(
     coverage_summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored, args)
 
     expanded = False
-    repair_scored = []
-    if coverage_summary["needs_direct_repair"]:
+    completion_scored = []
+    completion_steps = []
+    if coverage_summary["needs_critical_fact_completion"] or coverage_summary["needs_fact_completion"]:
         expanded = True
-        direct_repair_candidates = build_targeted_direct_repair_candidates(
+        completion_steps.append("critical_fact" if coverage_summary["needs_critical_fact_completion"] else "fact_completion")
+        fact_completion_candidates = build_targeted_fact_completion_candidates(
             fact,
             profile,
             fact_role,
@@ -767,17 +949,18 @@ def retrieve_one_fact(
             parent_results,
             args,
         )
-        if direct_repair_candidates:
-            direct_reranked = rerank_cross_encoder(
+        if fact_completion_candidates:
+            fact_reranked = rerank_cross_encoder(
                 crossencoder,
                 build_direct_repair_query_text(fact, profile, context),
-                direct_repair_candidates,
+                fact_completion_candidates,
             )
-            repair_scored.extend(enrich_fact_candidates(fact, profile, fact_role, direct_reranked, parent_results, context, args, critical_bonus))
+            completion_scored.extend(enrich_fact_candidates(fact, profile, fact_role, fact_reranked, parent_results, context, args, critical_bonus))
 
-    if coverage_summary["needs_bridge_repair"]:
+    if coverage_summary["needs_dependency_completion"]:
         expanded = True
-        bridge_repair_candidates = build_targeted_bridge_repair_candidates(
+        completion_steps.append("dependency_closure")
+        dependency_completion_candidates = build_targeted_dependency_completion_candidates(
             fact,
             profile,
             fact_role,
@@ -791,16 +974,62 @@ def retrieve_one_fact(
             biencoder,
             args,
         )
-        if bridge_repair_candidates:
-            bridge_reranked = rerank_cross_encoder(
+        if dependency_completion_candidates:
+            dependency_reranked = rerank_cross_encoder(
                 crossencoder,
                 build_bridge_repair_query_text(fact, profile, parent_results, context),
-                bridge_repair_candidates,
+                dependency_completion_candidates,
             )
-            repair_scored.extend(enrich_fact_candidates(fact, profile, fact_role, bridge_reranked, parent_results, context, args, critical_bonus))
+            completion_scored.extend(enrich_fact_candidates(fact, profile, fact_role, dependency_reranked, parent_results, context, args, critical_bonus))
 
-    if repair_scored:
-        scored = merge_candidate_lists(scored, repair_scored)
+    if coverage_summary["needs_cross_doc_bridge_completion"]:
+        expanded = True
+        completion_steps.append("cross_doc_bridge")
+        cross_doc_candidates = build_targeted_cross_doc_bridge_candidates(
+            fact,
+            profile,
+            fact_role,
+            claim_entry_s,
+            claim_entry_n,
+            context,
+            sentence_bank,
+            graph,
+            scored,
+            parent_results,
+            biencoder,
+            args,
+        )
+        if cross_doc_candidates:
+            cross_doc_reranked = rerank_cross_encoder(
+                crossencoder,
+                build_bridge_repair_query_text(fact, profile, parent_results, context),
+                cross_doc_candidates,
+            )
+            completion_scored.extend(enrich_fact_candidates(fact, profile, fact_role, cross_doc_reranked, parent_results, context, args, critical_bonus))
+
+    if coverage_summary["needs_anchor_completion"]:
+        expanded = True
+        completion_steps.append("anchor_constraint")
+        anchor_completion_candidates = build_targeted_anchor_completion_candidates(
+            fact,
+            profile,
+            fact_role,
+            context,
+            sentence_bank,
+            biencoder,
+            parent_results,
+            args,
+        )
+        if anchor_completion_candidates:
+            anchor_reranked = rerank_cross_encoder(
+                crossencoder,
+                build_direct_repair_query_text(fact, profile, context),
+                anchor_completion_candidates,
+            )
+            completion_scored.extend(enrich_fact_candidates(fact, profile, fact_role, anchor_reranked, parent_results, context, args, critical_bonus))
+
+    if completion_scored:
+        scored = merge_candidate_lists(scored, completion_scored)
         coverage_summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored, args)
 
     support_seed_candidates = coverage_summary["support_seed_candidates"] if coverage_summary["support_seed_candidates"] else scored
@@ -822,6 +1051,7 @@ def retrieve_one_fact(
         "entry_r": entry_r,
         "fact_profile": profile,
         "coverage_summary": coverage_summary,
+        "completion_steps": completion_steps,
         "support_profile": build_support_profile(support_seed_candidates, context, max_candidates=support_profile_k),
         "candidates": scored[:args.per_fact_output_k],
     }

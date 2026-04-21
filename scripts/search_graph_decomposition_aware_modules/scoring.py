@@ -5,6 +5,7 @@ from search_graph_hopaware import get_sim, norm_text
 from search_graph_decomposition_aware_modules.shared import (
     CONTEXT_DEPENDENT_STARTS,
     GENERIC_BACKGROUND_PATTERNS,
+    allow_relaxed_direct_tiers,
     build_parent_support_summary,
     clamp_score,
     get_direct_support_threshold,
@@ -270,6 +271,73 @@ def score_fact_completeness_penalty(candidate_features, fact_role, args):
     return float(max(0.0, penalty))
 
 
+def compute_direct_support_tier(
+    fact,
+    profile,
+    fact_role,
+    cand,
+    relation_match,
+    entity_pair,
+    target_match,
+    keyword_overlap,
+    constraint_consistency,
+    negation_compatibility,
+    context_independence,
+    binding,
+    direct_support_score,
+    bridge_support_pass,
+    dependency_closure_ready,
+    args,
+):
+    threshold = get_direct_support_threshold(fact_role, args)
+    relation_or_keyword_ready = (
+        relation_match > 0.0
+        or keyword_overlap >= args.min_keyword_overlap_for_direct_fallback
+    )
+    if bool(
+        direct_support_score >= threshold
+        and entity_pair >= args.min_entity_pair_for_direct
+        and relation_or_keyword_ready
+    ):
+        return "strong"
+
+    if not allow_relaxed_direct_tiers(fact_role, fact):
+        return "none"
+
+    weak_threshold = max(0.0, threshold - args.weak_direct_support_margin)
+    weak_relation_or_keyword_ready = (
+        relation_match >= args.min_relation_match_for_weak_direct
+        or keyword_overlap >= args.min_keyword_overlap_for_weak_direct
+    )
+    if bool(
+        direct_support_score >= weak_threshold
+        and entity_pair >= args.min_entity_pair_for_weak_direct
+        and weak_relation_or_keyword_ready
+        and context_independence >= args.min_context_independence_for_weak_direct
+        and negation_compatibility >= args.min_negation_compat_for_direct
+    ):
+        return "weak"
+
+    bridge_assisted_threshold = max(0.0, threshold - args.bridge_assisted_direct_margin)
+    bridge_assisted_ready = (
+        bool(fact.get("rely_on"))
+        and (
+            bridge_support_pass
+            or dependency_closure_ready
+            or binding["score"] >= args.binding_threshold
+        )
+    )
+    if bool(
+        bridge_assisted_ready
+        and direct_support_score >= bridge_assisted_threshold
+        and entity_pair >= args.min_entity_pair_for_bridge_assisted_direct
+        and relation_or_keyword_ready
+        and context_independence >= args.min_context_independence_for_bridge_assisted_direct
+    ):
+        return "bridge_assisted"
+    return "none"
+
+
 def compute_direct_support_pass(
     fact,
     profile,
@@ -284,15 +352,25 @@ def compute_direct_support_pass(
     context_independence,
     binding,
     direct_support_score,
+    bridge_support_pass,
+    dependency_closure_ready,
     args,
 ):
-    threshold = get_direct_support_threshold(fact_role, args)
-    relation_or_keyword_ready = (
-        relation_match > 0.0
-        or keyword_overlap >= args.min_keyword_overlap_for_direct_fallback
-    )
-    return bool(
-        direct_support_score >= threshold
-        and entity_pair >= args.min_entity_pair_for_direct
-        and relation_or_keyword_ready
-    )
+    return compute_direct_support_tier(
+        fact=fact,
+        profile=profile,
+        fact_role=fact_role,
+        cand=cand,
+        relation_match=relation_match,
+        entity_pair=entity_pair,
+        target_match=target_match,
+        keyword_overlap=keyword_overlap,
+        constraint_consistency=constraint_consistency,
+        negation_compatibility=negation_compatibility,
+        context_independence=context_independence,
+        binding=binding,
+        direct_support_score=direct_support_score,
+        bridge_support_pass=bridge_support_pass,
+        dependency_closure_ready=dependency_closure_ready,
+        args=args,
+    ) != "none"

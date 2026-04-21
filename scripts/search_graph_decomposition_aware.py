@@ -81,6 +81,7 @@ def main(args):
 
         fact_sequence = topological_sort_facts((sample.get("decomposition") or {}).get("atomic_facts", []))
         fact_stats = build_fact_graph_stats(fact_sequence)
+        fact_stats["claim_num_hops"] = int(sample.get("num_hops") or 0)
         fact_results = {}
         for fact in fact_sequence:
             parent_results = [fact_results[parent_id] for parent_id in fact.get("rely_on", []) if parent_id in fact_results]
@@ -121,9 +122,14 @@ def main(args):
                 "expanded": bool(fact_result["expanded"]),
                 "covered": bool((fact_result.get("coverage_summary") or {}).get("covered", False)),
                 "has_direct_support": bool((fact_result.get("coverage_summary") or {}).get("has_direct_support", False)),
+                "has_strong_direct_support": bool((fact_result.get("coverage_summary") or {}).get("has_strong_direct_support", False)),
+                "has_weak_direct_support": bool((fact_result.get("coverage_summary") or {}).get("has_weak_direct_support", False)),
+                "has_bridge_assisted_direct": bool((fact_result.get("coverage_summary") or {}).get("has_bridge_assisted_direct", False)),
+                "best_direct_support_tier": (fact_result.get("coverage_summary") or {}).get("best_direct_support_tier", "none"),
                 "dependency_closure": bool((fact_result.get("coverage_summary") or {}).get("dependency_closure", False)),
                 "top_fact_score": float((fact_result.get("coverage_summary") or {}).get("top_fact_score", 0.0)),
                 "top_direct_support_score": float((fact_result.get("coverage_summary") or {}).get("top_direct_support_score", 0.0)),
+                "completion_steps": list(fact_result.get("completion_steps") or []),
                 "selected_sids": fact_coverage.get(fact["id"], []),
                 "top_candidates": fact_result["candidates"][:args.fact_trace_k],
             })
@@ -231,12 +237,20 @@ if __name__ == "__main__":
     parser.add_argument("--verify_direct_support_threshold", type=float, default=0.62)
     parser.add_argument("--anchor_direct_support_threshold", type=float, default=0.60)
     parser.add_argument("--bridge_direct_support_threshold", type=float, default=0.52)
+    parser.add_argument("--weak_direct_support_margin", type=float, default=0.08)
+    parser.add_argument("--bridge_assisted_direct_margin", type=float, default=0.16)
     parser.add_argument("--min_direct_relation_score", type=float, default=0.16)
     parser.add_argument("--min_entity_pair_for_direct", type=float, default=0.45)
+    parser.add_argument("--min_entity_pair_for_weak_direct", type=float, default=0.32)
+    parser.add_argument("--min_entity_pair_for_bridge_assisted_direct", type=float, default=0.24)
     parser.add_argument("--min_relation_match_for_direct", type=float, default=0.16)
+    parser.add_argument("--min_relation_match_for_weak_direct", type=float, default=0.08)
     parser.add_argument("--min_keyword_overlap_for_direct_fallback", type=float, default=0.05)
+    parser.add_argument("--min_keyword_overlap_for_weak_direct", type=float, default=0.03)
     parser.add_argument("--min_negation_compat_for_direct", type=float, default=0.00)
     parser.add_argument("--min_context_independence_for_direct", type=float, default=0.18)
+    parser.add_argument("--min_context_independence_for_weak_direct", type=float, default=0.12)
+    parser.add_argument("--min_context_independence_for_bridge_assisted_direct", type=float, default=0.08)
     parser.add_argument("--min_constraint_consistency_for_anchor", type=float, default=0.20)
     parser.add_argument("--min_keyword_overlap_for_critical_direct", type=float, default=0.05)
     parser.add_argument("--fact_completeness_penalty_weight", type=float, default=0.18)
@@ -265,10 +279,12 @@ if __name__ == "__main__":
     parser.add_argument("--chain_binding_anchor_weight", type=float, default=0.65)
     parser.add_argument("--chain_critical_seed_weight", type=float, default=0.45)
     parser.add_argument("--chain_claim_weight", type=float, default=0.18)
+    parser.add_argument("--cross_doc_completion_weight", type=float, default=0.55)
+    parser.add_argument("--anchor_completion_weight", type=float, default=0.95)
 
     parser.add_argument("--assembly_candidates_per_fact", type=int, default=6)
     parser.add_argument("--base_max_docs_per_claim", type=int, default=2)
-    parser.add_argument("--max_docs_per_claim_cap", type=int, default=6)
+    parser.add_argument("--max_docs_per_claim_cap", type=int, default=7)
     parser.add_argument("--doc_budget_candidate_docs_threshold", type=int, default=6)
     parser.add_argument("--assembly_depth_gain", type=float, default=0.30)
     parser.add_argument("--assembly_child_gain", type=float, default=0.12)
@@ -278,8 +294,19 @@ if __name__ == "__main__":
     parser.add_argument("--assembly_dependency_gain", type=float, default=0.80)
     parser.add_argument("--assembly_cross_doc_gain", type=float, default=0.60)
     parser.add_argument("--assembly_fully_covered_gain", type=float, default=0.85)
-    parser.add_argument("--assembly_redundancy_weight", type=float, default=1.00)
+    parser.add_argument("--assembly_fact_covered_weight", type=float, default=3.50)
+    parser.add_argument("--assembly_critical_covered_weight", type=float, default=2.90)
+    parser.add_argument("--assembly_dependency_closed_weight", type=float, default=2.15)
+    parser.add_argument("--assembly_bridge_closed_weight", type=float, default=1.10)
+    parser.add_argument("--assembly_anchor_satisfied_weight", type=float, default=0.80)
+    parser.add_argument("--assembly_redundancy_weight", type=float, default=0.45)
+    parser.add_argument("--assembly_doc_penalty_weight", type=float, default=0.18)
+    parser.add_argument("--assembly_doc_fact_credit", type=float, default=0.75)
     parser.add_argument("--assembly_same_doc_penalty", type=float, default=0.10)
+    parser.add_argument("--assembly_3hop_critical_multiplier", type=float, default=1.40)
+    parser.add_argument("--assembly_4hop_critical_multiplier", type=float, default=1.75)
+    parser.add_argument("--assembly_3hop_dependency_multiplier", type=float, default=1.60)
+    parser.add_argument("--assembly_4hop_dependency_multiplier", type=float, default=2.10)
     parser.add_argument("--assembly_stop_gain", type=float, default=0.02)
 
     parser.add_argument("--max_export_entry_s", type=int, default=40)

@@ -461,6 +461,26 @@ def get_direct_support_threshold(fact_role, args):
     return args.direct_support_threshold
 
 
+DIRECT_SUPPORT_TIER_ORDER = {
+    "none": 0,
+    "bridge_assisted": 1,
+    "weak": 2,
+    "strong": 3,
+}
+
+
+def allow_relaxed_direct_tiers(fact_role, fact):
+    return fact_role == "verify" or bool(fact.get("critical"))
+
+
+def direct_support_tier_rank(tier):
+    return DIRECT_SUPPORT_TIER_ORDER.get((tier or "none"), 0)
+
+
+def direct_support_passes(tier):
+    return direct_support_tier_rank(tier) > 0
+
+
 def build_parent_support_summary(parent_results):
     summary = {
         "sids": set(),
@@ -624,6 +644,7 @@ def derive_binding_requirements(fact, profile, parent_results):
 
 def candidate_rank_key(candidate):
     return (
+        direct_support_tier_rank(candidate.get("direct_support_tier")),
         1 if candidate.get("support_type") == "direct_support" else 0,
         float(candidate.get("direct_support_score", 0.0)),
         float(candidate.get("aggregate_score", 0.0)),
@@ -656,20 +677,55 @@ def compute_fact_coverage_status(
     has_direct_support,
     dependency_closure_ready,
     has_bridge_support=False,
+    has_strong_direct_support=False,
+    has_weak_direct_support=False,
+    has_bridge_assisted_direct=False,
 ):
     requires_direct = requires_direct_support(fact_role, fact)
     closure_ready = bool(dependency_closure_ready)
-    support_ready = bool(has_direct_support) if requires_direct else bool(has_direct_support or has_bridge_support)
+    relaxed_direct_allowed = allow_relaxed_direct_tiers(fact_role, fact)
+
+    strong_direct = bool(has_strong_direct_support)
+    weak_direct = bool(has_weak_direct_support)
+    bridge_assisted_direct = bool(has_bridge_assisted_direct)
+    if bool(has_direct_support) and not (strong_direct or weak_direct or bridge_assisted_direct):
+        strong_direct = True
+
+    direct_support_tier = "none"
+    for tier_name, tier_active in (
+        ("strong", strong_direct),
+        ("weak", weak_direct),
+        ("bridge_assisted", bridge_assisted_direct),
+    ):
+        if tier_active:
+            direct_support_tier = tier_name
+            break
 
     if requires_direct:
+        strong_ready = strong_direct
+        weak_ready = bool(relaxed_direct_allowed and weak_direct and closure_ready)
+        bridge_assisted_ready = bool(relaxed_direct_allowed and bridge_assisted_direct and closure_ready)
+        support_ready = bool(strong_ready or weak_ready or bridge_assisted_ready)
         covered = support_ready
-        fully_covered = support_ready and closure_ready
+        fully_covered = bool(covered and closure_ready)
     else:
-        covered = support_ready and closure_ready
+        strong_ready = strong_direct
+        weak_ready = bool(weak_direct and closure_ready)
+        bridge_assisted_ready = bool(bridge_assisted_direct and closure_ready)
+        support_ready = bool(has_direct_support or has_bridge_support or bridge_assisted_direct)
+        covered = bool(support_ready and closure_ready)
         fully_covered = covered
 
     return {
         "requires_direct_support": bool(requires_direct),
+        "relaxed_direct_allowed": bool(relaxed_direct_allowed),
+        "direct_support_tier": direct_support_tier,
+        "has_strong_direct_support": bool(strong_direct),
+        "has_weak_direct_support": bool(weak_direct),
+        "has_bridge_assisted_direct": bool(bridge_assisted_direct),
+        "strong_direct_ready": bool(strong_ready),
+        "weak_direct_ready": bool(weak_ready),
+        "bridge_assisted_ready": bool(bridge_assisted_ready),
         "support_ready": bool(support_ready),
         "closure_ready": bool(closure_ready),
         "covered": bool(covered),

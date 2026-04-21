@@ -7,6 +7,7 @@ from search_graph_decomposition_aware_modules.shared import (
     candidate_rank_key,
     collect_support_from_sids,
     compute_fact_coverage_status,
+    direct_support_tier_rank,
     get_fact_bridge_helper_budget,
     get_fact_direct_winner_budget,
 )
@@ -97,6 +98,10 @@ def _merge_sentence_pool_candidate(sentence_pool, fact_id, cand):
         "bridge_support_pass": bool(cand["bridge_support_pass"]),
         "direct_support_score": float(cand["direct_support_score"]),
         "direct_support_pass": bool(cand["direct_support_pass"]),
+        "direct_support_tier": cand.get("direct_support_tier", "none"),
+        "strong_direct_support_pass": bool(cand.get("strong_direct_support_pass", False)),
+        "weak_direct_support_pass": bool(cand.get("weak_direct_support_pass", False)),
+        "bridge_assisted_direct_pass": bool(cand.get("bridge_assisted_direct_pass", False)),
         "dependency_closure_ready": bool(cand["dependency_closure_ready"]),
         "support_type": cand["support_type"],
         "fact_role": cand["fact_role"],
@@ -125,29 +130,158 @@ def build_sentence_support_pool(fact_results, topk_per_fact):
     return sentence_pool
 
 
+def _get_effective_hop_count(fact_stats):
+    return max(
+        int((fact_stats or {}).get("max_depth", 1)),
+        int((fact_stats or {}).get("claim_num_hops") or 0),
+    )
+
+
+def _estimate_fact_doc_floor(fact_stats):
+    fact_count = int((fact_stats or {}).get("fact_count", 0))
+    if fact_count <= 2:
+        return 1
+    return max(2, (fact_count + 1) // 2)
+
+
 def compute_dynamic_doc_budget(fact_sequence, fact_stats, sentence_pool, args):
     candidate_doc_count = len({item["docid"] for item in sentence_pool.values() if item.get("docid")})
+    hop_count = _get_effective_hop_count(fact_stats)
+    fact_doc_floor = min(args.max_docs_per_claim_cap, _estimate_fact_doc_floor(fact_stats))
     budget = args.base_max_docs_per_claim
-    if fact_stats["fact_count"] >= 4:
-        budget += 1
-    if fact_stats["fact_count"] >= 6:
-        budget += 1
-    if fact_stats["max_depth"] >= 3:
-        budget += 1
-    if fact_stats["max_depth"] >= 4:
-        budget += 1
-    if fact_stats["critical_count"] >= 2:
-        budget += 1
-    if candidate_doc_count >= args.doc_budget_candidate_docs_threshold:
-        budget += 1
+    if hop_count <= 2:
+        budget = max(budget, min(fact_doc_floor, args.base_max_docs_per_claim + 1))
+        if fact_stats["critical_count"] >= 2:
+            budget += 1
+    elif hop_count == 3:
+        budget = max(budget, hop_count, fact_doc_floor)
+        if fact_stats["critical_count"] >= 2:
+            budget += 1
+        if candidate_doc_count >= args.doc_budget_candidate_docs_threshold:
+            budget += 1
+    else:
+        budget = max(budget, hop_count + 1, fact_doc_floor + 1)
+        if fact_stats["critical_count"] >= 2:
+            budget += 1
+        if candidate_doc_count >= args.doc_budget_candidate_docs_threshold:
+            budget += 1
     budget = max(1, min(args.max_docs_per_claim_cap, budget))
     return budget, {
         "base_max_docs_per_claim": int(args.base_max_docs_per_claim),
+        "claim_num_hops": int((fact_stats or {}).get("claim_num_hops") or 0),
+        "effective_hop_count": int(hop_count),
         "fact_count": int(fact_stats["fact_count"]),
+        "fact_doc_floor": int(fact_doc_floor),
         "dag_depth": int(fact_stats["max_depth"]),
         "critical_fact_count": int(fact_stats["critical_count"]),
         "candidate_doc_count": int(candidate_doc_count),
         "dynamic_max_docs_per_claim": int(budget),
+    }
+
+
+def _scale_multihop_weight(base_weight, max_depth, hop3_multiplier, hop4_multiplier):
+    weight = float(base_weight)
+    if max_depth >= 4:
+        return weight * float(hop4_multiplier)
+    if max_depth >= 3:
+        return weight * float(hop3_multiplier)
+    return weight
+
+
+def _compute_doc_soft_free_allowance(fact_stats, args):
+    hop_count = _get_effective_hop_count(fact_stats)
+    fact_doc_floor = _estimate_fact_doc_floor(fact_stats)
+    free_docs = args.base_max_docs_per_claim
+    if hop_count == 3:
+        free_docs = max(free_docs, min(args.max_docs_per_claim_cap, max(3, fact_doc_floor)))
+    elif hop_count >= 4:
+        free_docs = max(free_docs, min(args.max_docs_per_claim_cap, max(4, fact_doc_floor + 1)))
+    return int(max(1, min(args.max_docs_per_claim_cap, free_docs)))
+
+
+def _compute_assembly_doc_penalty(selected_docs, fact_stats, args):
+    free_docs = _compute_doc_soft_free_allowance(fact_stats, args)
+    return float(max(0, len(selected_docs) - free_docs))
+
+
+def _count_new_fact_carrying_docs(current_state, trial_state):
+    current_covered = current_state.get("covered_facts") or set()
+    trial_doc_fact_map = trial_state.get("doc_fact_map") or {}
+    new_docids = (trial_state.get("docids") or set()) - (current_state.get("docids") or set())
+    informative_docs = 0.0
+    for docid in new_docids:
+        new_facts = set(trial_doc_fact_map.get(docid) or set()) - set(current_covered)
+        if new_facts:
+            informative_docs += 1.0
+    return float(informative_docs)
+
+
+def _collect_direct_tier_flags(records):
+    tiers = [item["support"].get("direct_support_tier", "none") for item in records]
+    return {
+        "has_strong_direct_support": any(tier == "strong" for tier in tiers),
+        "has_weak_direct_support": any(tier == "weak" for tier in tiers),
+        "has_bridge_assisted_direct": any(tier == "bridge_assisted" for tier in tiers),
+        "best_direct_support_tier": max(tiers, key=direct_support_tier_rank) if tiers else "none",
+    }
+
+
+def _compute_assembly_utility_components(state, fact_stats, args):
+    max_depth = _get_effective_hop_count(fact_stats)
+    critical_weight = _scale_multihop_weight(
+        args.assembly_critical_covered_weight,
+        max_depth,
+        args.assembly_3hop_critical_multiplier,
+        args.assembly_4hop_critical_multiplier,
+    )
+    dependency_weight = _scale_multihop_weight(
+        args.assembly_dependency_closed_weight,
+        max_depth,
+        args.assembly_3hop_dependency_multiplier,
+        args.assembly_4hop_dependency_multiplier,
+    )
+    return {
+        "fact_weight": float(args.assembly_fact_covered_weight),
+        "critical_weight": float(critical_weight),
+        "dependency_weight": float(dependency_weight),
+        "bridge_weight": float(args.assembly_bridge_closed_weight),
+        "anchor_weight": float(args.assembly_anchor_satisfied_weight),
+        "redundancy_weight": float(args.assembly_redundancy_weight),
+        "doc_weight": float(args.assembly_doc_penalty_weight),
+    }
+
+
+def _compute_assembly_gain(current_state, trial_state, fact_stats, args):
+    weights = _compute_assembly_utility_components(trial_state, fact_stats, args)
+    new_fact_covered = len(trial_state["covered_facts"] - current_state["covered_facts"])
+    new_critical_covered = len(trial_state["critical_covered_facts"] - current_state["critical_covered_facts"])
+    new_dependency_closed = len(trial_state["dependency_closed_facts"] - current_state["dependency_closed_facts"])
+    new_bridge_closed = len(trial_state["bridge_closed_facts"] - current_state["bridge_closed_facts"])
+    new_anchor_satisfied = len(trial_state["anchor_satisfied_facts"] - current_state["anchor_satisfied_facts"])
+    new_redundancy = max(0.0, float(trial_state["redundancy"]) - float(current_state["redundancy"]))
+    new_doc_penalty = max(0.0, float(trial_state["doc_penalty"]) - float(current_state["doc_penalty"]))
+    doc_fact_credit = args.assembly_doc_fact_credit * _count_new_fact_carrying_docs(current_state, trial_state)
+    new_doc_penalty = max(0.0, new_doc_penalty - doc_fact_credit)
+    gain = (
+        weights["fact_weight"] * new_fact_covered
+        + weights["critical_weight"] * new_critical_covered
+        + weights["dependency_weight"] * new_dependency_closed
+        + weights["bridge_weight"] * new_bridge_closed
+        + weights["anchor_weight"] * new_anchor_satisfied
+        - weights["redundancy_weight"] * new_redundancy
+        - weights["doc_weight"] * new_doc_penalty
+    )
+    return {
+        "gain": float(gain),
+        "new_fact_covered": int(new_fact_covered),
+        "new_critical_covered": int(new_critical_covered),
+        "new_dependency_closed": int(new_dependency_closed),
+        "new_bridge_closed": int(new_bridge_closed),
+        "new_anchor_satisfied": int(new_anchor_satisfied),
+        "new_redundancy": float(new_redundancy),
+        "new_doc_penalty": float(new_doc_penalty),
+        "doc_fact_credit": float(doc_fact_credit),
+        "weights": weights,
     }
 
 
@@ -172,6 +306,7 @@ def _sort_direct_support_items(items):
     return sorted(
         items,
         key=lambda x: (
+            direct_support_tier_rank(x[1].get("direct_support_tier")),
             float(x[1].get("direct_support_score", 0.0)),
             float(x[1].get("fact_score", 0.0)),
             -float(x[1].get("fact_completeness_penalty", 0.0)),
@@ -259,8 +394,13 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
     )
     covered_facts = set()
     fully_covered_facts = set()
+    critical_covered_facts = set()
+    dependency_closed_facts = set()
+    bridge_closed_facts = set()
+    anchor_satisfied_facts = set()
     fact_witnesses = {}
     facts_by_sid = defaultdict(list)
+    doc_fact_map = defaultdict(set)
     coverage_value = 0.0
     dependency_covered = 0
     cross_doc_bridge_count = 0
@@ -305,6 +445,7 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
 
         helper_budget = get_fact_bridge_helper_budget(fact, fact_stats, args) if parents else 0
         helper_records = []
+        direct_tier_flags = _collect_direct_tier_flags(direct_records)
 
         if fact_role == "bridge":
             primary_record = None
@@ -362,6 +503,7 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
             )
             support_sids = [primary_sid] + [item["sid"] for item in helper_records]
             direct_sids = []
+            direct_tier_flags = _collect_direct_tier_flags([])
         else:
             if parents and direct_records and not dependency_ready and helper_budget > 0:
                 for sid, support in bridge_candidates:
@@ -390,6 +532,9 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
                 has_direct_support=bool(direct_records),
                 dependency_closure_ready=dependency_ready,
                 has_bridge_support=bool(helper_records),
+                has_strong_direct_support=direct_tier_flags["has_strong_direct_support"],
+                has_weak_direct_support=direct_tier_flags["has_weak_direct_support"],
+                has_bridge_assisted_direct=direct_tier_flags["has_bridge_assisted_direct"],
             )
             direct_sids = [item["sid"] for item in direct_records]
             support_sids = direct_sids + [item["sid"] for item in helper_records]
@@ -398,6 +543,10 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
             continue
 
         covered_facts.add(fid)
+        if fact.get("critical"):
+            critical_covered_facts.add(fid)
+        if fact_role == "anchor":
+            anchor_satisfied_facts.add(fid)
         if coverage_status["fully_covered"]:
             fully_covered_facts.add(fid)
         depth = fact_stats["depth_map"].get(fid, 1)
@@ -415,21 +564,47 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
             coverage_value += args.assembly_fully_covered_gain
 
         bridge_evals = [item["bridge_eval"] for item in helper_records]
+        closure_bridge_evals = [item["bridge_eval"] for item in direct_records] + bridge_evals
         if fact_role == "bridge":
             bridge_evals = [primary_bridge_eval] + bridge_evals
+            closure_bridge_evals = list(bridge_evals)
 
         if parents and coverage_status["fully_covered"]:
             dependency_covered += 1
-            if any(bridge_eval.get("cross_doc", 0.0) > 0 for bridge_eval in bridge_evals):
+            dependency_closed_facts.add(fid)
+            if any(bridge_eval.get("cross_doc", 0.0) > 0 for bridge_eval in closure_bridge_evals):
                 cross_doc_bridge_count += 1
+        bridge_closure_ready = bool(
+            coverage_status["fully_covered"]
+            and (
+                fact_role == "bridge"
+                or helper_records
+                or any(
+                    bridge_eval.get("satisfied")
+                    or bridge_eval.get("score", 0.0) >= args.bridge_threshold
+                    or bridge_eval.get("cross_doc", 0.0) > 0
+                    for bridge_eval in closure_bridge_evals
+                )
+            )
+        )
+        if bridge_closure_ready:
+            bridge_closed_facts.add(fid)
 
         fact_witnesses[fid] = {
             "sid": primary_sid,
             "direct_sids": direct_sids,
             "helper_sids": [item["sid"] for item in helper_records],
             "support_sids": support_sids,
+            "fact_role": fact_role,
             "covered": bool(coverage_status["covered"]),
             "fully_covered": bool(coverage_status["fully_covered"]),
+            "dependency_closed": bool(fid in dependency_closed_facts),
+            "bridge_closed": bool(fid in bridge_closed_facts),
+            "anchor_satisfied": bool(fid in anchor_satisfied_facts),
+            "best_direct_support_tier": direct_tier_flags["best_direct_support_tier"],
+            "has_strong_direct_support": bool(direct_tier_flags["has_strong_direct_support"]),
+            "has_weak_direct_support": bool(direct_tier_flags["has_weak_direct_support"]),
+            "has_bridge_assisted_direct": bool(direct_tier_flags["has_bridge_assisted_direct"]),
             "fact_score": float(primary_support.get("fact_score", 0.0)),
             "direct_support_score": float(max([item["support"].get("direct_support_score", 0.0) for item in direct_records] or [0.0])),
             "bridge_score": float(max(
@@ -440,6 +615,9 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
         }
         for sid in support_sids:
             facts_by_sid[sid].append(fid)
+            docid = sentence_pool[sid].get("docid")
+            if docid:
+                doc_fact_map[docid].add(fid)
 
     redundancy = 0.0
     for i, sid_i in enumerate(selected_sids):
@@ -452,25 +630,39 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
             if doc_i and doc_j and doc_i == doc_j:
                 redundancy += args.assembly_same_doc_penalty
 
-    critical_covered = sum(1 for fact in fact_sequence if fact.get("critical") and fact["id"] in covered_facts)
-    utility = coverage_value
-    utility += args.assembly_dependency_gain * dependency_covered
-    utility += args.assembly_cross_doc_gain * cross_doc_bridge_count
-    utility -= args.assembly_redundancy_weight * redundancy
-    if len(selected_docs) > doc_budget:
-        utility -= 10.0 * (len(selected_docs) - doc_budget)
+    critical_covered = len(critical_covered_facts)
+    doc_penalty = _compute_assembly_doc_penalty(selected_docs, fact_stats, args)
+    utility_weights = _compute_assembly_utility_components({}, fact_stats, args)
+    utility = 0.0
+    utility += utility_weights["fact_weight"] * len(covered_facts)
+    utility += utility_weights["critical_weight"] * critical_covered
+    utility += utility_weights["dependency_weight"] * len(dependency_closed_facts)
+    utility += utility_weights["bridge_weight"] * len(bridge_closed_facts)
+    utility += utility_weights["anchor_weight"] * len(anchor_satisfied_facts)
+    utility -= utility_weights["redundancy_weight"] * redundancy
+    utility -= utility_weights["doc_weight"] * doc_penalty
 
     return {
         "utility": float(utility),
         "covered_facts": covered_facts,
         "fully_covered_facts": fully_covered_facts,
+        "critical_covered_facts": critical_covered_facts,
+        "dependency_closed_facts": dependency_closed_facts,
+        "bridge_closed_facts": bridge_closed_facts,
+        "anchor_satisfied_facts": anchor_satisfied_facts,
         "fact_witnesses": fact_witnesses,
         "facts_by_sid": {sid: fact_ids for sid, fact_ids in facts_by_sid.items()},
         "critical_covered": int(critical_covered),
         "fully_covered_count": int(len(fully_covered_facts)),
+        "dependency_closed": int(len(dependency_closed_facts)),
         "dependency_covered": int(dependency_covered),
+        "bridge_closed": int(len(bridge_closed_facts)),
+        "anchor_satisfied": int(len(anchor_satisfied_facts)),
         "cross_doc_bridge_count": int(cross_doc_bridge_count),
         "docids": selected_docs,
+        "doc_fact_map": {docid: set(fids) for docid, fids in doc_fact_map.items()},
+        "doc_penalty": float(doc_penalty),
+        "coverage_value": float(coverage_value),
         "redundancy": float(redundancy),
     }
 
@@ -497,20 +689,37 @@ def rescue_uncovered_facts(selected_sids, sentence_pool, fact_sequence, fact_sta
             -len(fact_stats["children"].get(fact["id"], [])),
         ),
     )
+    hop_count = _get_effective_hop_count(fact_stats)
 
     while len(current_sids) < args.max_evidence:
-        current_docids = set(current_state["docids"])
         best_sid = None
         best_state = None
-        best_gain = None
+        best_rank = None
 
         for fact in ordered_facts:
             fid = fact["id"]
-            if fid in current_state["covered_facts"]:
+            fact_role = fact.get("role", "verify")
+            parents = [pid for pid in fact.get("rely_on", []) if pid in fact_stats["id2fact"]]
+            needs_repair = (
+                fid not in current_state["covered_facts"]
+                or (parents and fid not in current_state["dependency_closed_facts"])
+                or (fact_role == "bridge" and fid not in current_state["bridge_closed_facts"])
+                or (fact_role == "anchor" and fid not in current_state["anchor_satisfied_facts"])
+            )
+            if not needs_repair:
                 continue
 
             summary = (result_by_id.get(fid) or {}).get("coverage_summary") or {}
-            candidates = _merge_selection_candidates(
+            candidate_groups = []
+            if fid not in current_state["covered_facts"]:
+                candidate_groups.append(summary.get("direct_candidates") or [])
+            if parents and fid not in current_state["dependency_closed_facts"]:
+                candidate_groups.append(summary.get("bridge_candidates") or [])
+            if summary.get("needs_cross_doc_bridge_completion"):
+                candidate_groups.append(summary.get("bridge_candidates") or [])
+            if fact_role == "anchor" and fid not in current_state["anchor_satisfied_facts"]:
+                candidate_groups.append(summary.get("direct_candidates") or [])
+            candidates = _merge_selection_candidates(*candidate_groups) if candidate_groups else _merge_selection_candidates(
                 summary.get("direct_candidates") or [],
                 summary.get("bridge_candidates") or [],
             )
@@ -520,8 +729,6 @@ def rescue_uncovered_facts(selected_sids, sentence_pool, fact_sequence, fact_sta
             for cand in candidates[:args.assembly_candidates_per_fact]:
                 sid = cand["sid"]
                 if sid in current_sid_set or sid not in sentence_pool:
-                    continue
-                if not _can_add_sid_with_doc_budget(sid, sentence_pool, current_docids, doc_budget):
                     continue
 
                 trial_sids = current_sids + [sid]
@@ -535,25 +742,48 @@ def rescue_uncovered_facts(selected_sids, sentence_pool, fact_sequence, fact_sta
                     doc_budget,
                     args,
                 )
-                new_covered = len(trial_state["covered_facts"] - current_state["covered_facts"])
-                new_fully_covered = len(trial_state["fully_covered_facts"] - current_state["fully_covered_facts"])
-                new_critical = trial_state["critical_covered"] - current_state["critical_covered"]
-                utility_gain = trial_state["utility"] - current_state["utility"]
-                if new_covered <= 0 and new_fully_covered <= 0 and new_critical <= 0 and utility_gain < args.assembly_stop_gain:
+                gain_info = _compute_assembly_gain(current_state, trial_state, fact_stats, args)
+                if (
+                    gain_info["new_fact_covered"] <= 0
+                    and gain_info["new_critical_covered"] <= 0
+                    and gain_info["new_dependency_closed"] <= 0
+                    and gain_info["new_bridge_closed"] <= 0
+                    and gain_info["new_anchor_satisfied"] <= 0
+                    and gain_info["gain"] < args.assembly_stop_gain
+                ):
                     continue
 
-                gain = (
-                    2.0 * new_critical
-                    + 1.5 * new_fully_covered
-                    + 1.0 * new_covered
-                    + utility_gain
-                    + 0.12 * fact_stats["depth_map"].get(fid, 1)
-                    + (0.15 if sentence_pool[sid].get("docid") in current_docids else 0.0)
+                if hop_count >= 4:
+                    priority_rank = (
+                        int(gain_info["new_fact_covered"]),
+                        int(gain_info["new_dependency_closed"]),
+                        int(gain_info["new_critical_covered"]),
+                    )
+                elif hop_count >= 3:
+                    priority_rank = (
+                        int(gain_info["new_fact_covered"]),
+                        int(gain_info["new_critical_covered"]),
+                        int(gain_info["new_dependency_closed"]),
+                    )
+                else:
+                    priority_rank = (
+                        int(gain_info["new_fact_covered"]),
+                        int(gain_info["new_critical_covered"]),
+                        int(gain_info["new_dependency_closed"]),
+                    )
+                rank = (
+                    priority_rank,
+                    float(gain_info["gain"]),
+                    int(gain_info["new_bridge_closed"]),
+                    int(gain_info["new_anchor_satisfied"]),
+                    -float(gain_info["new_doc_penalty"]),
+                    -float(gain_info["new_redundancy"]),
+                    candidate_rank_key(cand),
                 )
-                if best_gain is None or gain > best_gain:
+                if best_rank is None or rank > best_rank:
                     best_sid = sid
                     best_state = trial_state
-                    best_gain = gain
+                    best_rank = rank
 
         if best_sid is None:
             break
@@ -576,8 +806,13 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             "covered_facts": [],
             "critical_covered": 0,
             "fully_covered_count": 0,
+            "dependency_closed": 0,
             "dependency_covered": 0,
+            "bridge_closed": 0,
+            "anchor_satisfied": 0,
             "cross_doc_bridge_count": 0,
+            "doc_penalty": 0.0,
+            "utility": 0.0,
         }
         return [], {}, empty_summary
 
@@ -630,6 +865,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
         chosen_helpers = []
         dependency_ready = not parents
         primary = chosen_direct[0] if chosen_direct else None
+        direct_tier_flags = _collect_direct_tier_flags([{"sid": cand["sid"], "support": cand} for cand in chosen_direct])
 
         if fact_role == "bridge":
             primary = None
@@ -695,6 +931,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             helper_sids = [item["candidate"]["sid"] for item in chosen_helpers]
             support_sids = [primary["sid"]] + helper_sids
             bridge_evals = [primary_bridge_eval] + [item["bridge_eval"] for item in chosen_helpers]
+            direct_tier_flags = _collect_direct_tier_flags([])
         else:
             if not chosen_direct:
                 continue
@@ -747,6 +984,9 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
                 has_direct_support=bool(chosen_direct),
                 dependency_closure_ready=dependency_ready,
                 has_bridge_support=bool(chosen_helpers),
+                has_strong_direct_support=direct_tier_flags["has_strong_direct_support"],
+                has_weak_direct_support=direct_tier_flags["has_weak_direct_support"],
+                has_bridge_assisted_direct=direct_tier_flags["has_bridge_assisted_direct"],
             )
             direct_sids = [item["sid"] for item in chosen_direct]
             helper_sids = [item["candidate"]["sid"] for item in chosen_helpers]
@@ -764,6 +1004,10 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             "support_sids": support_sids,
             "covered": bool(coverage_status["covered"]),
             "fully_covered": bool(coverage_status["fully_covered"]),
+            "best_direct_support_tier": direct_tier_flags["best_direct_support_tier"],
+            "has_strong_direct_support": bool(direct_tier_flags["has_strong_direct_support"]),
+            "has_weak_direct_support": bool(direct_tier_flags["has_weak_direct_support"]),
+            "has_bridge_assisted_direct": bool(direct_tier_flags["has_bridge_assisted_direct"]),
             "fact_score": float(primary.get("fact_score", 0.0)),
             "direct_support_score": float(primary.get("direct_support_score", 0.0)),
             "bridge_score": float(max(
@@ -791,7 +1035,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
         args,
     )
     rescue_added = max(0, len(selected_sids) - len(initial_selected_sids))
-    selection_stage = "hard_two_stage_rescue" if rescue_added else "hard_two_stage"
+    selection_stage = "hard_two_stage_chain_completion" if rescue_added else "hard_two_stage"
     fact_coverage = defaultdict(list)
     for fid, witness in state["fact_witnesses"].items():
         fact_coverage[fid] = list(witness.get("support_sids") or [])
@@ -813,6 +1057,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
                 "aggregate_score": float(support["aggregate_score"]),
                 "fact_score": float(support["fact_score"]),
                 "support_type": support.get("support_type"),
+                "direct_support_tier": support.get("direct_support_tier", "none"),
                 "direct_support_score": float(support.get("direct_support_score", 0.0)),
                 "bridge_support_score": float(support.get("bridge_support_score", 0.0)),
                 "covered": bool(witness and sid in (witness.get("direct_sids") or [witness.get("sid")])),
@@ -835,6 +1080,10 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             cross_doc_bridge_score = max(s["cross_doc_bridge_score"] for s in supports)
             coverage_score = max(s["coverage_score"] for s in supports)
             critical_bonus = max(s["critical_coverage_bonus"] for s in supports)
+            direct_support_tier = max(
+                [s.get("direct_support_tier", "none") for s in supports],
+                key=direct_support_tier_rank,
+            )
             support_type = "direct_support" if any(s.get("support_type") == "direct_support" for s in supports) else "bridge_support"
         else:
             score = item["score"]
@@ -851,6 +1100,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             cross_doc_bridge_score = 0.0
             coverage_score = 0.0
             critical_bonus = 0.0
+            direct_support_tier = "none"
             support_type = "bridge_support"
 
         selected.append({
@@ -861,6 +1111,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             "score": float(score),
             "fact_score": float(fact_score),
             "support_type": support_type,
+            "direct_support_tier": direct_support_tier,
             "direct_support_score": float(direct_support_score),
             "bridge_support_score": float(bridge_support_score),
             "semantic_relevance": float(semantic_relevance),
@@ -878,7 +1129,16 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             "selection_stage": selection_stage,
         })
 
-    selected.sort(key=lambda x: (1 if x.get("support_type") == "direct_support" else 0, float(x.get("direct_support_score", 0.0)), float(x.get("fact_score", 0.0)), float(x.get("score", 0.0))), reverse=True)
+    selected.sort(
+        key=lambda x: (
+            direct_support_tier_rank(x.get("direct_support_tier")),
+            1 if x.get("support_type") == "direct_support" else 0,
+            float(x.get("direct_support_score", 0.0)),
+            float(x.get("fact_score", 0.0)),
+            float(x.get("score", 0.0)),
+        ),
+        reverse=True,
+    )
 
     assembly_summary = dict(budget_summary)
     assembly_summary.update({
@@ -887,10 +1147,16 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
         "covered_facts": sorted(state["covered_facts"], key=lambda fid: fact_stats["depth_map"].get(fid, 1)),
         "critical_covered": int(state["critical_covered"]),
         "fully_covered_count": int(state["fully_covered_count"]),
+        "dependency_closed": int(state["dependency_closed"]),
         "dependency_covered": int(state["dependency_covered"]),
+        "bridge_closed": int(state["bridge_closed"]),
+        "anchor_satisfied": int(state["anchor_satisfied"]),
         "cross_doc_bridge_count": int(state["cross_doc_bridge_count"]),
+        "doc_penalty": float(state["doc_penalty"]),
+        "utility": float(state["utility"]),
         "redundancy": float(state["redundancy"]),
         "rescue_added": int(rescue_added),
+        "completion_added": int(rescue_added),
         "selection_mode": selection_stage,
     })
     return selected, dict(fact_coverage), assembly_summary
