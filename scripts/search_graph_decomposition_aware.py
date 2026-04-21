@@ -268,7 +268,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--assembly_candidates_per_fact", type=int, default=6)
     parser.add_argument("--base_max_docs_per_claim", type=int, default=2)
-    parser.add_argument("--max_docs_per_claim_cap", type=int, default=5)
+    parser.add_argument("--max_docs_per_claim_cap", type=int, default=6)
     parser.add_argument("--doc_budget_candidate_docs_threshold", type=int, default=6)
     parser.add_argument("--assembly_depth_gain", type=float, default=0.30)
     parser.add_argument("--assembly_child_gain", type=float, default=0.12)

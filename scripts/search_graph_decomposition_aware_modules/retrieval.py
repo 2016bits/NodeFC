@@ -150,6 +150,12 @@ def build_bridge_repair_query_text(fact, profile, parent_results, context):
     return " ".join(ordered)
 
 
+def build_fact_rerank_query_text(fact, profile, fact_role, parent_results, context):
+    if fact_role == "bridge" or parent_results:
+        return build_bridge_repair_query_text(fact, profile, parent_results, context)
+    return build_direct_repair_query_text(fact, profile, context)
+
+
 def filter_anchor_candidates(candidates, profile, context, args):
     if not candidates or not (profile["numbers"] or profile["time_tokens"] or profile["quantity_tokens"]):
         return candidates
@@ -693,8 +699,20 @@ def retrieve_one_fact(
     fact["role"] = fact_role
     profile["fact_role"] = fact_role
 
+    depth = fact_stats["depth_map"].get(fact["id"], 1)
     entry_k_s = args.critical_fact_k if critical else args.fact_k
     candidate_k = get_role_candidate_budget(fact_role, critical, args)
+    if critical or depth >= args.multi_bridge_depth_threshold:
+        candidate_k = max(candidate_k, args.expanded_candidate_k)
+    elif (
+        fact_role == "bridge"
+        or depth >= 3
+        or len(fact.get("rely_on", [])) > 1
+        or fact_stats["max_depth"] >= args.multi_bridge_depth_threshold
+    ):
+        candidate_k = max(candidate_k, args.fact_candidate_k)
+    entry_k_s = max(entry_k_s, min(candidate_k, args.expanded_candidate_k))
+
     base_entry_s = topk_normalize(semantic_entry_from_bank(biencoder, fact["text"], sentence_bank, topk=entry_k_s), entry_k_s)
     lexical_entry_s = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="base", topk=max(entry_k_s, candidate_k * 2))
     constraint_entry_s = build_constraint_entry(profile, biencoder, sentence_bank, topk=max(args.constraint_k, candidate_k))
@@ -730,7 +748,8 @@ def retrieve_one_fact(
     if fact_role == "anchor":
         local_candidates = filter_anchor_candidates(local_candidates, profile, context, args)
 
-    reranked = rerank_cross_encoder(crossencoder, fact["text"], local_candidates)
+    rerank_query_text = build_fact_rerank_query_text(fact, profile, fact_role, parent_results, context)
+    reranked = rerank_cross_encoder(crossencoder, rerank_query_text, local_candidates)
     scored = enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, context, args, critical_bonus)
     coverage_summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored, args)
 
@@ -749,7 +768,11 @@ def retrieve_one_fact(
             args,
         )
         if direct_repair_candidates:
-            direct_reranked = rerank_cross_encoder(crossencoder, fact["text"], direct_repair_candidates)
+            direct_reranked = rerank_cross_encoder(
+                crossencoder,
+                build_direct_repair_query_text(fact, profile, context),
+                direct_repair_candidates,
+            )
             repair_scored.extend(enrich_fact_candidates(fact, profile, fact_role, direct_reranked, parent_results, context, args, critical_bonus))
 
     if coverage_summary["needs_bridge_repair"]:
@@ -769,7 +792,11 @@ def retrieve_one_fact(
             args,
         )
         if bridge_repair_candidates:
-            bridge_reranked = rerank_cross_encoder(crossencoder, fact["text"], bridge_repair_candidates)
+            bridge_reranked = rerank_cross_encoder(
+                crossencoder,
+                build_bridge_repair_query_text(fact, profile, parent_results, context),
+                bridge_repair_candidates,
+            )
             repair_scored.extend(enrich_fact_candidates(fact, profile, fact_role, bridge_reranked, parent_results, context, args, critical_bonus))
 
     if repair_scored:

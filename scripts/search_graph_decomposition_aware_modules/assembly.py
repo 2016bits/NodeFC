@@ -128,11 +128,15 @@ def build_sentence_support_pool(fact_results, topk_per_fact):
 def compute_dynamic_doc_budget(fact_sequence, fact_stats, sentence_pool, args):
     candidate_doc_count = len({item["docid"] for item in sentence_pool.values() if item.get("docid")})
     budget = args.base_max_docs_per_claim
-    if fact_stats["fact_count"] >= 5:
+    if fact_stats["fact_count"] >= 4:
+        budget += 1
+    if fact_stats["fact_count"] >= 6:
+        budget += 1
+    if fact_stats["max_depth"] >= 3:
         budget += 1
     if fact_stats["max_depth"] >= 4:
         budget += 1
-    if fact_stats["critical_count"] >= 3:
+    if fact_stats["critical_count"] >= 2:
         budget += 1
     if candidate_doc_count >= args.doc_budget_candidate_docs_threshold:
         budget += 1
@@ -221,6 +225,19 @@ def _add_sid_to_selection(sid, selected_sids, selected_sid_set, selected_docids,
     docid = sentence_pool.get(sid, {}).get("docid")
     if docid:
         selected_docids.add(docid)
+
+
+def _merge_selection_candidates(*candidate_lists):
+    merged = {}
+    for candidates in candidate_lists:
+        for cand in candidates or []:
+            sid = cand.get("sid")
+            if not sid:
+                continue
+            prev = merged.get(sid)
+            if prev is None or candidate_rank_key(cand) > candidate_rank_key(prev):
+                merged[sid] = cand
+    return sorted(merged.values(), key=candidate_rank_key, reverse=True)
 
 
 def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stats, context, semantic_sim_map, doc_budget, args):
@@ -458,6 +475,96 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
     }
 
 
+def rescue_uncovered_facts(selected_sids, sentence_pool, fact_sequence, fact_stats, context, semantic_sim_map, doc_budget, result_by_id, args):
+    current_sids = [sid for sid in selected_sids if sid in sentence_pool]
+    current_state = evaluate_selected_set(
+        current_sids,
+        sentence_pool,
+        fact_sequence,
+        fact_stats,
+        context,
+        semantic_sim_map,
+        doc_budget,
+        args,
+    )
+    current_sid_set = set(current_sids)
+
+    ordered_facts = sorted(
+        fact_sequence,
+        key=lambda fact: (
+            0 if fact.get("critical") else 1,
+            -fact_stats["depth_map"].get(fact["id"], 1),
+            -len(fact_stats["children"].get(fact["id"], [])),
+        ),
+    )
+
+    while len(current_sids) < args.max_evidence:
+        current_docids = set(current_state["docids"])
+        best_sid = None
+        best_state = None
+        best_gain = None
+
+        for fact in ordered_facts:
+            fid = fact["id"]
+            if fid in current_state["covered_facts"]:
+                continue
+
+            summary = (result_by_id.get(fid) or {}).get("coverage_summary") or {}
+            candidates = _merge_selection_candidates(
+                summary.get("direct_candidates") or [],
+                summary.get("bridge_candidates") or [],
+            )
+            if not candidates:
+                continue
+
+            for cand in candidates[:args.assembly_candidates_per_fact]:
+                sid = cand["sid"]
+                if sid in current_sid_set or sid not in sentence_pool:
+                    continue
+                if not _can_add_sid_with_doc_budget(sid, sentence_pool, current_docids, doc_budget):
+                    continue
+
+                trial_sids = current_sids + [sid]
+                trial_state = evaluate_selected_set(
+                    trial_sids,
+                    sentence_pool,
+                    fact_sequence,
+                    fact_stats,
+                    context,
+                    semantic_sim_map,
+                    doc_budget,
+                    args,
+                )
+                new_covered = len(trial_state["covered_facts"] - current_state["covered_facts"])
+                new_fully_covered = len(trial_state["fully_covered_facts"] - current_state["fully_covered_facts"])
+                new_critical = trial_state["critical_covered"] - current_state["critical_covered"]
+                utility_gain = trial_state["utility"] - current_state["utility"]
+                if new_covered <= 0 and new_fully_covered <= 0 and new_critical <= 0 and utility_gain < args.assembly_stop_gain:
+                    continue
+
+                gain = (
+                    2.0 * new_critical
+                    + 1.5 * new_fully_covered
+                    + 1.0 * new_covered
+                    + utility_gain
+                    + 0.12 * fact_stats["depth_map"].get(fid, 1)
+                    + (0.15 if sentence_pool[sid].get("docid") in current_docids else 0.0)
+                )
+                if best_gain is None or gain > best_gain:
+                    best_sid = sid
+                    best_state = trial_state
+                    best_gain = gain
+
+        if best_sid is None:
+            break
+
+        current_sids.append(best_sid)
+        current_sid_set.add(best_sid)
+        current_state = best_state
+
+    return current_sids, current_state
+
+
 def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, semantic_sim_map, args):
     sentence_pool = build_sentence_support_pool(fact_results, topk_per_fact=args.assembly_candidates_per_fact)
     if not sentence_pool:
@@ -671,6 +778,23 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
 
     selected_sids = [sid for sid in selected_sids if sid in sentence_pool]
     state = evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stats, context, semantic_sim_map, doc_budget, args)
+    initial_selected_sids = list(selected_sids)
+    selected_sids, state = rescue_uncovered_facts(
+        selected_sids,
+        sentence_pool,
+        fact_sequence,
+        fact_stats,
+        context,
+        semantic_sim_map,
+        doc_budget,
+        result_by_id,
+        args,
+    )
+    rescue_added = max(0, len(selected_sids) - len(initial_selected_sids))
+    selection_stage = "hard_two_stage_rescue" if rescue_added else "hard_two_stage"
+    fact_coverage = defaultdict(list)
+    for fid, witness in state["fact_witnesses"].items():
+        fact_coverage[fid] = list(witness.get("support_sids") or [])
 
     selected = []
     for sid in selected_sids:
@@ -751,7 +875,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             "coverage_score": float(coverage_score),
             "supporting_facts": supporting_facts,
             "support_details": support_details,
-            "selection_stage": "hard_two_stage",
+            "selection_stage": selection_stage,
         })
 
     selected.sort(key=lambda x: (1 if x.get("support_type") == "direct_support" else 0, float(x.get("direct_support_score", 0.0)), float(x.get("fact_score", 0.0)), float(x.get("score", 0.0))), reverse=True)
@@ -766,6 +890,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
         "dependency_covered": int(state["dependency_covered"]),
         "cross_doc_bridge_count": int(state["cross_doc_bridge_count"]),
         "redundancy": float(state["redundancy"]),
-        "selection_mode": "hard_two_stage",
+        "rescue_added": int(rescue_added),
+        "selection_mode": selection_stage,
     })
     return selected, dict(fact_coverage), assembly_summary
