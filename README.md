@@ -1,6 +1,10 @@
 # retrieve with BM25
 ```bash
 python scripts/bm25_retrieve.py
+# dual-route coarse retrieval: claim BM25 + atomic-fact BM25
+# if you already have decomposition results, pass --decomposition_path
+# example:
+# python scripts/bm25_retrieve.py --split dev --decomposition_path data/plan4.2/dev_2_decomposed_0_4000.json
 ```
 We can get retrieved documents: bm25_dev.json
 ```python
@@ -10,7 +14,7 @@ result = {
     'gold_evidence': gold_evidence[{"title", "index", "sentences"}]
     'label': label("SPPORTS"/"REFUTES"),
     'num_hops': num_hops,
-    'retrieved_docs': retrieved_docs[{"docid", "score", "text"}],
+    'retrieved_docs': retrieved_docs[{"docid", "score", "text", "retrieval_routes", "matched_atomic_fact_ids"}],
 }
 ```
 
@@ -35,6 +39,7 @@ sent_nodes:
     'doc_rank': rank,   # retrieve top number
     'doc_score': score,
     'sent_idx': sent_idx,
+    'is_title': bool(sent_idx == 0),
     'sentences': sent,
 }
 ```
@@ -92,4 +97,3 @@ python scripts/utils/extract_hover_predicted_evidence.py --plan plan4.3
 ```bash
 python scripts/utils/evaluate_evidence_retrieval.py --plan plan4.3
 ```
-

@@ -33,6 +33,7 @@ from search_graph_decomposition_aware_modules.shared import (
     get_direct_support_threshold,
     get_role_candidate_budget,
     infer_fact_role,
+    is_title_candidate,
     merge_score_maps,
     normalize_sentence_node_scores,
     requires_direct_support,
@@ -69,9 +70,9 @@ def build_sentence_recall_entry(fact, profile, fact_role, parent_results, contex
             elif fact_role == "anchor":
                 score += 0.12 * constraint_consistency
         elif mode == "bridge":
-            score = 0.36 * bridge["score"] + 0.28 * binding["score"] + 0.16 * same_parent_doc + 0.12 * relation_match + 0.08 * keyword_overlap
+            score = 0.32 * bridge["score"] + 0.30 * binding["score"] + 0.18 * same_parent_doc + 0.12 * relation_match + 0.08 * keyword_overlap
             if fact_role == "bridge":
-                score += 0.10 * bridge["entity_overlap"] + 0.06 * bridge["relation_overlap"]
+                score += 0.12 * bridge["entity_overlap"] + 0.08 * bridge["relation_overlap"] + 0.06 * bridge["constraint_overlap"]
         else:
             score = 0.24 * entity_pair + 0.18 * relation_match + 0.18 * keyword_overlap + 0.16 * target_match + 0.10 * constraint_consistency + 0.04 * negation_compatibility + 0.10 * binding["score"]
             if fact_role == "verify":
@@ -81,6 +82,7 @@ def build_sentence_recall_entry(fact, profile, fact_role, parent_results, contex
             elif fact_role == "anchor":
                 score += 0.14 * constraint_consistency
 
+        score -= candidate_title_penalty({"sid": sid}, context, args, "title_recall_penalty")
         if score > 0:
             scores[sid] = float(score)
 
@@ -178,6 +180,68 @@ def filter_anchor_candidates(candidates, profile, context, args):
     return filtered
 
 
+def candidate_title_penalty(candidate, context, args, field_name):
+    if not is_title_candidate(candidate, context):
+        return 0.0
+    return float(getattr(args, field_name, 0.0) or 0.0)
+
+
+def seed_candidate_is_clean(candidate, args):
+    if candidate.get("is_title"):
+        return False
+
+    entity_overlap = float(candidate.get("entity_pair_score", 0.0))
+    relation_match = float(candidate.get("relation_match_score", 0.0))
+    constraint_match = max(0.0, float(candidate.get("time_quantity_consistency", 0.0)))
+    binding_score = float(candidate.get("binding_score", 0.0))
+    direct_support_score = float(candidate.get("direct_support_score", 0.0))
+
+    shared_signal = (
+        entity_overlap >= args.seed_min_entity_overlap
+        or constraint_match >= args.seed_min_constraint_match
+        or (relation_match >= args.seed_min_relation_match and binding_score >= args.seed_min_binding_score)
+    )
+    if candidate.get("direct_support_pass"):
+        return shared_signal and direct_support_score >= args.seed_min_direct_support_score
+    if not candidate.get("bridge_support_pass"):
+        return False
+    return shared_signal and binding_score >= args.seed_min_binding_score
+
+
+def select_support_seed_candidates(direct_candidates, bridge_candidates, args):
+    filtered_direct = [cand for cand in direct_candidates if seed_candidate_is_clean(cand, args)]
+    filtered_bridge = [cand for cand in bridge_candidates if seed_candidate_is_clean(cand, args)]
+
+    if filtered_direct:
+        return filtered_direct[:args.max_support_seed_candidates]
+    if filtered_bridge:
+        return filtered_bridge[:args.max_bridge_seed_candidates]
+
+    fallback_direct = [cand for cand in direct_candidates if not cand.get("is_title")]
+    if fallback_direct:
+        return fallback_direct[:1]
+    fallback_bridge = [cand for cand in bridge_candidates if not cand.get("is_title")]
+    if fallback_bridge:
+        return fallback_bridge[:1]
+    if direct_candidates:
+        return direct_candidates[:1]
+    return bridge_candidates[:1]
+
+
+def select_chain_seed_candidates(scored_candidates, args):
+    ordered = sorted(scored_candidates or [], key=candidate_rank_key, reverse=True)
+    direct = [cand for cand in ordered if cand.get("direct_support_pass") and seed_candidate_is_clean(cand, args)]
+    if direct:
+        return direct[:args.chain_seed_k]
+    bridge = [cand for cand in ordered if cand.get("bridge_support_pass") and seed_candidate_is_clean(cand, args)]
+    if bridge:
+        return bridge[:min(args.chain_seed_k, args.max_bridge_seed_candidates)]
+    fallback = [cand for cand in ordered if not cand.get("is_title")]
+    if fallback:
+        return fallback[:1]
+    return ordered[:1]
+
+
 def get_role_ranking_weights(fact_role):
     if fact_role == "bridge":
         return {
@@ -265,6 +329,8 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
         bridge = score_upstream_bridge(cand, parent_results, context, context["semantic_sim_map"], args)
         binding = score_binding_coverage(binding_requirements, cand, context)
         doc_rank_bonus = 1.0 / (1.0 + max(0, cand.get("doc_rank", 10**9)))
+        title_score_penalty = candidate_title_penalty(cand, context, args, "title_score_penalty")
+        title_bridge_penalty = candidate_title_penalty(cand, context, args, "title_bridge_penalty")
 
         direct_support_score = clamp_score(
             weights["ce"] * ce_norm
@@ -277,12 +343,14 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             + weights["negation"] * max(0.0, negation_compatibility)
             + weights["context"] * context_independence
             - weights["background_penalty"] * background_penalty
+            - title_score_penalty
         )
         bridge_support_score = clamp_score(
-            0.48 * max(0.0, bridge["score"])
-            + 0.27 * binding["score"]
-            + 0.15 * dependency_norm
-            + 0.10 * ppr_norm
+            0.44 * max(0.0, bridge["score"])
+            + 0.30 * binding["score"]
+            + 0.18 * dependency_norm
+            + 0.08 * ppr_norm
+            - title_bridge_penalty
         )
 
         bridge_support_pass = bridge_support_score >= args.bridge_threshold or bridge["satisfied"] or binding["score"] >= args.binding_threshold
@@ -332,6 +400,7 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             + 0.10 * context_independence
             + 0.12 * max(0.0, negation_compatibility)
             - args.fact_completeness_penalty_weight * completeness_penalty
+            - 0.55 * title_score_penalty
         )
         aggregate_score = (
             1.55 * direct_support_score
@@ -347,6 +416,7 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             + critical_bonus
             - 0.20 * background_penalty
             - args.fact_completeness_penalty_weight * completeness_penalty
+            - 1.15 * title_score_penalty
         )
         coverage_score = 0.74 * direct_support_score + 0.16 * bridge_support_score + 0.10 * max(0.0, constraint_consistency)
 
@@ -408,6 +478,8 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             "aggregate_score": float(aggregate_score),
             "coverage_gate_pass": bool(coverage_gate_pass),
             "fact_completeness_penalty": float(completeness_penalty),
+            "is_title": bool(cand.get("is_title", False)),
+            "title_score_penalty": float(title_score_penalty),
         })
         scored.append(item)
 
@@ -462,13 +534,7 @@ def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidat
     direct_winner_budget = get_fact_direct_winner_budget(fact, fact_role)
     direct_winners = direct_candidates[:direct_winner_budget]
     bridge_winners = bridge_candidates[:1] if fact_role == "bridge" else []
-
-    support_seed_candidates = list(direct_winners if direct_winners else bridge_winners)
-    seen_sids = {cand["sid"] for cand in support_seed_candidates}
-    for cand in bridge_candidates:
-        if cand["sid"] not in seen_sids:
-            support_seed_candidates.append(cand)
-            seen_sids.add(cand["sid"])
+    support_seed_candidates = select_support_seed_candidates(direct_winners, bridge_winners, args)
 
     covered = bool(parent_covered and coverage_status["covered"])
     fully_covered = bool(parent_covered and coverage_status["fully_covered"])
@@ -548,7 +614,7 @@ def build_chain_bridge_sentence_map(binding_requirements, parent_results, contex
     for sid in context["sid_list"]:
         binding = score_binding_coverage(binding_requirements, {"sid": sid}, context)
         bridge = score_bridge_features(sid, parent_summary, context, context["semantic_sim_map"], args)
-        score = 0.45 * binding["score"] + 0.45 * bridge["score"] + 0.10 * bridge["cross_doc"]
+        score = 0.38 * binding["score"] + 0.34 * bridge["score"] + 0.18 * bridge["constraint_overlap"] + 0.10 * bridge["cross_doc"]
         if score > 0:
             scores[sid] = score
     return topk_normalize(scores, args.chain_seed_k)
@@ -588,9 +654,11 @@ def build_chain_completion_entries(
     for rid in binding_requirements["rids"]:
         expanded_r[rid] += args.chain_binding_anchor_weight
 
-    for cand in scored_candidates[:args.chain_seed_k]:
+    for cand in select_chain_seed_candidates(scored_candidates, args):
         if cand["bridge_score"] >= args.bridge_threshold or cand["binding_score"] >= args.binding_threshold or cand["fact_score"] >= args.fact_score_threshold:
             seed_weight = 0.5 * max(cand["fact_score"], cand["bridge_score"], cand["binding_score"])
+            if cand.get("is_title"):
+                seed_weight = max(0.0, seed_weight - args.title_bridge_penalty)
             expanded_s[cand["sid"]] += seed_weight
             for eid in context["sid2eids"].get(cand["sid"], set()):
                 expanded_n[eid] += 0.25 * seed_weight
@@ -598,7 +666,7 @@ def build_chain_completion_entries(
                 expanded_r[rid] += 0.25 * seed_weight
 
     if fact.get("critical"):
-        for cand in scored_candidates[:args.chain_seed_k]:
+        for cand in select_chain_seed_candidates(scored_candidates, args):
             expanded_s[cand["sid"]] += args.chain_critical_seed_weight * cand["fact_score"]
         for eid, score in top_score_items(profile["entry_n"], 4):
             expanded_n[eid] += args.chain_critical_seed_weight * float(score)
@@ -645,6 +713,7 @@ def build_targeted_fact_completion_candidates(
             "dependency_score": {},
             "ppr_score": {},
         },
+        args=args,
     )
     if fact_role == "anchor":
         candidates = filter_anchor_candidates(candidates, profile, context, args)
@@ -705,6 +774,7 @@ def build_targeted_dependency_completion_candidates(
             "dependency_score": bridge_lexical,
             "ppr_score": ppr_scores,
         },
+        args=args,
     )
     if fact_role == "anchor":
         candidates = filter_anchor_candidates(candidates, profile, context, args)
@@ -774,6 +844,7 @@ def build_targeted_cross_doc_bridge_candidates(
             "dependency_score": bridge_lexical,
             "ppr_score": ppr_scores,
         },
+        args=args,
     )
     cross_doc_candidates = [
         cand for cand in candidates
@@ -814,6 +885,7 @@ def build_targeted_anchor_completion_candidates(
             "dependency_score": {},
             "ppr_score": {},
         },
+        args=args,
     )
     return filter_anchor_candidates(candidates, profile, context, args)
 
@@ -924,6 +996,7 @@ def retrieve_one_fact(
             "dependency_score": dependency_entry_s,
             "ppr_score": {},
         },
+        args=args,
     )
     if fact_role == "anchor":
         local_candidates = filter_anchor_candidates(local_candidates, profile, context, args)

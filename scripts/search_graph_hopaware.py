@@ -269,13 +269,28 @@ def build_hetero_graph(sent_nodes, entity_nodes, relation_nodes,
                        sn_edges, sr_edges, nrn_edges,
                        semantic_edges=[],
                        w_sn=1.0, w_sr=0.6, w_nrn=1.0, w_ss=0.5,
-                       min_sen_sim=0.25):
+                       min_sen_sim=0.25,
+                       w_ss_entity_bonus=0.20,
+                       w_ss_relation_bonus=0.14,
+                       w_ss_number_bonus=0.08,
+                       w_ss_title_penalty=0.45):
     graph = defaultdict(list)
+    sid2eids = defaultdict(set)
+    sid2rids = defaultdict(set)
+    sid2numbers = {}
+    sid2is_title = {}
+
+    for sent in sent_nodes or []:
+        sid = str(sent.get("sid"))
+        text = sent.get("sentences") or sent.get("text") or ""
+        sid2numbers[sid] = extract_numbers(text)
+        sid2is_title[sid] = bool(sent.get("is_title", int(sent.get("sent_idx", -1)) == 0))
     
     # S-N edges
     for edge in sn_edges:
         u = f"S::{edge['sid']}"
         v = f"N::{edge['eid']}"
+        sid2eids[str(edge["sid"])].add(str(edge["eid"]))
         add_edge(graph, u, v, w_sn)
         add_edge(graph, v, u, w_sn)
     
@@ -283,6 +298,7 @@ def build_hetero_graph(sent_nodes, entity_nodes, relation_nodes,
     for edge in sr_edges:
         u = f"S::{edge['sid']}"
         v = f"R::{edge['rid']}"
+        sid2rids[str(edge["sid"])].add(str(edge["rid"]))
         add_edge(graph, u, v, w_sr)
         add_edge(graph, v, u, w_sr)
     
@@ -302,9 +318,31 @@ def build_hetero_graph(sent_nodes, entity_nodes, relation_nodes,
             sim = float(edge.get('sim', 0.0))
             if sim < min_sen_sim:
                 continue
-            u = f"S::{edge['sid1']}"
-            v = f"S::{edge['sid2']}"
-            w = w_ss * sim
+            sid1_raw = edge.get("sid1")
+            sid2_raw = edge.get("sid2")
+            if sid1_raw is None or sid2_raw is None:
+                continue
+            sid1 = str(sid1_raw)
+            sid2 = str(sid2_raw)
+            u = f"S::{sid1}"
+            v = f"S::{sid2}"
+            shared_entity = 0.0
+            if sid2eids.get(sid1) and sid2eids.get(sid2):
+                shared_entity = len(sid2eids[sid1] & sid2eids[sid2]) / max(1, min(len(sid2eids[sid1]), len(sid2eids[sid2])))
+            shared_relation = 0.0
+            if sid2rids.get(sid1) and sid2rids.get(sid2):
+                shared_relation = len(sid2rids[sid1] & sid2rids[sid2]) / max(1, min(len(sid2rids[sid1]), len(sid2rids[sid2])))
+            shared_number = 0.0
+            if sid2numbers.get(sid1) and sid2numbers.get(sid2):
+                shared_number = len(sid2numbers[sid1] & sid2numbers[sid2]) / max(1, min(len(sid2numbers[sid1]), len(sid2numbers[sid2])))
+            structure_bonus = (
+                1.0
+                + w_ss_entity_bonus * shared_entity
+                + w_ss_relation_bonus * shared_relation
+                + w_ss_number_bonus * shared_number
+            )
+            title_penalty = 1.0 - w_ss_title_penalty if (sid2is_title.get(sid1) or sid2is_title.get(sid2)) else 1.0
+            w = w_ss * sim * structure_bonus * max(0.0, title_penalty)
             add_edge(graph, u, v, w)
             add_edge(graph, v, u, w)
     

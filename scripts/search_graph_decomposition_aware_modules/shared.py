@@ -186,6 +186,22 @@ def normalize_sentence_node_scores(score_map, topk):
     return topk_normalize(sent_scores, topk)
 
 
+def is_title_sid(context, sid):
+    meta = (context or {}).get("sid2meta", {}).get(sid) or {}
+    return bool(meta.get("is_title", False))
+
+
+def is_title_candidate(candidate, context=None):
+    if not candidate:
+        return False
+    if "is_title" in candidate:
+        return bool(candidate.get("is_title", False))
+    sid = candidate.get("sid")
+    if sid is None or context is None:
+        return False
+    return is_title_sid(context, sid)
+
+
 def build_example_context(node, edge):
     sid2meta = {}
     sid_list = []
@@ -199,6 +215,7 @@ def build_example_context(node, edge):
         text = sent.get("sentences") or sent.get("text") or ""
         if not text:
             continue
+        is_title = bool(sent.get("is_title", int(sent.get("sent_idx", -1)) == 0))
         sid_list.append(sid)
         sent_texts.append(text)
         sid2meta[sid] = {
@@ -206,6 +223,7 @@ def build_example_context(node, edge):
             "docid": sent.get("docid"),
             "doc_rank": int(sent.get("doc_rank", 10**9)),
             "sent_idx": int(sent.get("sent_idx", -1)),
+            "is_title": is_title,
         }
         sid2keywords[sid] = extract_keywords_simple(text)
         sid2numbers[sid] = extract_numbers(text)
@@ -292,14 +310,23 @@ def semantic_entry_from_bank(biencoder, query_text, sentence_bank, topk):
     return {sentence_bank["sid_list"][i]: float(scores[i]) for i in top_idx}
 
 
-def select_sentence_candidates(context, sentence_scores, topk, component_maps=None):
+def select_sentence_candidates(context, sentence_scores, topk, component_maps=None, args=None):
     component_maps = component_maps or {}
+    title_penalty = float(getattr(args, "title_candidate_recall_penalty", 0.0) or 0.0)
+
+    def _effective_score(sid):
+        score = float(lookup_sentence_score(sentence_scores, sid))
+        if is_title_sid(context, sid):
+            score -= title_penalty
+        return score
+
     ranked = sorted(
         context["sid_list"],
         key=lambda sid: (
-            lookup_sentence_score(sentence_scores, sid),
+            _effective_score(sid),
             lookup_sentence_score(component_maps.get("lexical_score"), sid),
             lookup_sentence_score(component_maps.get("dense_score"), sid),
+            0 if is_title_sid(context, sid) else 1,
         ),
         reverse=True,
     )[:topk]
@@ -307,9 +334,12 @@ def select_sentence_candidates(context, sentence_scores, topk, component_maps=No
     for sid in ranked:
         meta = context["sid2meta"][sid]
         ppr_score = lookup_sentence_score(component_maps.get("ppr_score"), sid)
+        raw_recall_score = float(lookup_sentence_score(sentence_scores, sid))
+        recall_score = _effective_score(sid)
         out.append({
             "sid": sid,
-            "recall_score": float(lookup_sentence_score(sentence_scores, sid)),
+            "recall_score": float(recall_score),
+            "raw_recall_score": float(raw_recall_score),
             "dense_score": float(lookup_sentence_score(component_maps.get("dense_score"), sid)),
             "lexical_score": float(lookup_sentence_score(component_maps.get("lexical_score"), sid)),
             "constraint_score": float(lookup_sentence_score(component_maps.get("constraint_score"), sid)),
@@ -319,6 +349,7 @@ def select_sentence_candidates(context, sentence_scores, topk, component_maps=No
             "text": meta["text"],
             "doc_rank": meta["doc_rank"],
             "docid": meta["docid"],
+            "is_title": bool(meta.get("is_title", False)),
         })
     return out
 
@@ -487,6 +518,9 @@ def build_parent_support_summary(parent_results):
         "eids": set(),
         "rids": set(),
         "docids": set(),
+        "numbers": set(),
+        "time_tokens": set(),
+        "quantity_tokens": set(),
         "fact_ids": [],
     }
     for parent in parent_results:
@@ -498,6 +532,9 @@ def build_parent_support_summary(parent_results):
         summary["eids"].update(support.get("eids", set()))
         summary["rids"].update(support.get("rids", set()))
         summary["docids"].update(support.get("docids", set()))
+        summary["numbers"].update(support.get("numbers", set()))
+        summary["time_tokens"].update(support.get("time_tokens", set()))
+        summary["quantity_tokens"].update(support.get("quantity_tokens", set()))
     return summary
 
 
@@ -580,27 +617,55 @@ def build_dependency_seed_maps(parent_results):
 
 
 def build_support_profile(candidates, context, max_candidates):
-    profile = {"sids": set(), "eids": set(), "rids": set(), "docids": set()}
+    profile = {
+        "sids": set(),
+        "eids": set(),
+        "rids": set(),
+        "docids": set(),
+        "numbers": set(),
+        "time_tokens": set(),
+        "quantity_tokens": set(),
+    }
     ordered = sorted(candidates or [], key=candidate_rank_key, reverse=True)
-    for cand in ordered[:max_candidates]:
+    kept = 0
+    for cand in ordered:
         sid = cand["sid"]
-        profile["sids"].add(sid)
-        profile["eids"].update(context["sid2eids"].get(sid, set()))
-        profile["rids"].update(context["sid2rids"].get(sid, set()))
         docid = context["sid2meta"].get(sid, {}).get("docid")
         if docid:
             profile["docids"].add(docid)
+        if is_title_candidate(cand, context):
+            continue
+        if kept >= max_candidates:
+            break
+        profile["sids"].add(sid)
+        profile["eids"].update(context["sid2eids"].get(sid, set()))
+        profile["rids"].update(context["sid2rids"].get(sid, set()))
+        profile["numbers"].update(context["sid2numbers"].get(sid, set()))
+        profile["time_tokens"].update(context["sid2time_tokens"].get(sid, set()))
+        profile["quantity_tokens"].update(context["sid2quantity_tokens"].get(sid, set()))
+        kept += 1
     return profile
 
 
 def collect_support_from_sids(sids, context):
-    summary = {"sids": set(), "eids": set(), "rids": set(), "docids": set()}
+    summary = {
+        "sids": set(),
+        "eids": set(),
+        "rids": set(),
+        "docids": set(),
+        "numbers": set(),
+        "time_tokens": set(),
+        "quantity_tokens": set(),
+    }
     for sid in sids:
         if sid not in context["sid2meta"]:
             continue
         summary["sids"].add(sid)
         summary["eids"].update(context["sid2eids"].get(sid, set()))
         summary["rids"].update(context["sid2rids"].get(sid, set()))
+        summary["numbers"].update(context["sid2numbers"].get(sid, set()))
+        summary["time_tokens"].update(context["sid2time_tokens"].get(sid, set()))
+        summary["quantity_tokens"].update(context["sid2quantity_tokens"].get(sid, set()))
         docid = context["sid2meta"][sid].get("docid")
         if docid:
             summary["docids"].add(docid)
@@ -646,6 +711,7 @@ def candidate_rank_key(candidate):
     return (
         direct_support_tier_rank(candidate.get("direct_support_tier")),
         1 if candidate.get("support_type") == "direct_support" else 0,
+        0 if candidate.get("is_title") else 1,
         float(candidate.get("direct_support_score", 0.0)),
         float(candidate.get("aggregate_score", 0.0)),
         float(candidate.get("fact_score", 0.0)),

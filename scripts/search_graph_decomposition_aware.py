@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 
 from sentence_transformers import CrossEncoder, SentenceTransformer
@@ -22,13 +22,13 @@ from search_graph_decomposition_aware_modules.shared import (
 )
 
 def main(args):
-    with open(args.decomposition_path, "r", encoding="utf-8") as f:
+    with open(args.decomposition_path.replace('[PLAN]', args.plan), "r", encoding="utf-8") as f:
         decomposed_data = json.load(f)
-    with open(args.nodes_path.replace("[SPLIT]", args.split), "r", encoding="utf-8") as f:
+    with open(args.nodes_path.replace("[SPLIT]", args.split).replace('[PLAN]', args.plan), "r", encoding="utf-8") as f:
         nodes = json.load(f)
-    with open(args.edges_path.replace("[SPLIT]", args.split), "r", encoding="utf-8") as f:
+    with open(args.edges_path.replace("[SPLIT]", args.split).replace('[PLAN]', args.plan), "r", encoding="utf-8") as f:
         edges = json.load(f)
-    with open(args.semantic_edges_path.replace("[SPLIT]", args.split), "r", encoding="utf-8") as f:
+    with open(args.semantic_edges_path.replace("[SPLIT]", args.split).replace('[PLAN]', args.plan), "r", encoding="utf-8") as f:
         semantic_edges = json.load(f)
 
     if args.limit > 0:
@@ -73,6 +73,10 @@ def main(args):
             w_nrn=args.w_nrn,
             w_ss=args.w_ss,
             min_sen_sim=args.min_sen_sim,
+            w_ss_entity_bonus=args.w_ss_entity_bonus,
+            w_ss_relation_bonus=args.w_ss_relation_bonus,
+            w_ss_number_bonus=args.w_ss_number_bonus,
+            w_ss_title_penalty=args.w_ss_title_penalty,
         )
 
         claim = sample["claim"]
@@ -148,7 +152,7 @@ def main(args):
             "assembly_summary": assembly_summary,
         })
 
-    out_path = args.out_path.replace("[PLAN]", args.plan).replace("[SPLIT]", args.split)
+    out_path = args.out_path.replace("[PLAN]", args.plan).replace("[SPLIT]", args.split).replace('[PLAN]', args.plan)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
@@ -158,10 +162,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--decomposition_path", type=str, default="./data/plan4.2/dev_2_decomposed_0_4000.json")
-    parser.add_argument("--nodes_path", type=str, default="./data/plan1/bm25_nodes_[SPLIT].json")
-    parser.add_argument("--edges_path", type=str, default="./data/plan1/bm25_edges_[SPLIT].json")
-    parser.add_argument("--semantic_edges_path", type=str, default="./data/plan1/bm25_semantic_edges_[SPLIT].json")
+    parser.add_argument("--decomposition_path", type=str, default="./data/[PLAN]/dev_2_decomposed_0_4000.json")
+    parser.add_argument("--nodes_path", type=str, default="./data/[PLAN]/bm25_nodes_[SPLIT].json")
+    parser.add_argument("--edges_path", type=str, default="./data/[PLAN]/bm25_edges_[SPLIT].json")
+    parser.add_argument("--semantic_edges_path", type=str, default="./data/[PLAN]/bm25_semantic_edges_[SPLIT].json")
     parser.add_argument("--out_path", type=str, default="./data/[PLAN]/nodefc_decomposition_aware_dev_0_4000.json")
     parser.add_argument("--split", type=str, default="dev")
     parser.add_argument("--limit", type=int, default=0)
@@ -207,6 +211,10 @@ if __name__ == "__main__":
     parser.add_argument("--w_nrn", type=float, default=1.0)
     parser.add_argument("--w_ss", type=float, default=0.6)
     parser.add_argument("--min_sen_sim", type=float, default=0.25)
+    parser.add_argument("--w_ss_entity_bonus", type=float, default=0.20)
+    parser.add_argument("--w_ss_relation_bonus", type=float, default=0.14)
+    parser.add_argument("--w_ss_number_bonus", type=float, default=0.08)
+    parser.add_argument("--w_ss_title_penalty", type=float, default=0.45)
     parser.add_argument("--ppr_alpha", type=float, default=0.68)
     parser.add_argument("--ppr_max_iter", type=int, default=25)
 
@@ -233,6 +241,7 @@ if __name__ == "__main__":
     parser.add_argument("--bridge_threshold", type=float, default=0.28)
     parser.add_argument("--root_target_threshold", type=float, default=0.18)
     parser.add_argument("--bridge_semantic_threshold", type=float, default=0.42)
+    parser.add_argument("--bridge_constraint_threshold", type=float, default=0.30)
     parser.add_argument("--direct_support_threshold", type=float, default=0.58)
     parser.add_argument("--verify_direct_support_threshold", type=float, default=0.62)
     parser.add_argument("--anchor_direct_support_threshold", type=float, default=0.60)
@@ -271,6 +280,17 @@ if __name__ == "__main__":
     parser.add_argument("--max_bridge_per_complex_fact", type=int, default=3)
     parser.add_argument("--multi_bridge_depth_threshold", type=int, default=4)
     parser.add_argument("--redundancy_threshold", type=float, default=0.88)
+    parser.add_argument("--seed_min_entity_overlap", type=float, default=0.25)
+    parser.add_argument("--seed_min_relation_match", type=float, default=0.10)
+    parser.add_argument("--seed_min_constraint_match", type=float, default=0.10)
+    parser.add_argument("--seed_min_binding_score", type=float, default=0.25)
+    parser.add_argument("--seed_min_direct_support_score", type=float, default=0.55)
+    parser.add_argument("--max_support_seed_candidates", type=int, default=2)
+    parser.add_argument("--max_bridge_seed_candidates", type=int, default=1)
+    parser.add_argument("--title_recall_penalty", type=float, default=0.12)
+    parser.add_argument("--title_candidate_recall_penalty", type=float, default=0.08)
+    parser.add_argument("--title_score_penalty", type=float, default=0.18)
+    parser.add_argument("--title_bridge_penalty", type=float, default=0.20)
 
     parser.add_argument("--chain_seed_k", type=int, default=8)
     parser.add_argument("--chain_parent_sentence_weight", type=float, default=0.55)
@@ -301,6 +321,7 @@ if __name__ == "__main__":
     parser.add_argument("--assembly_anchor_satisfied_weight", type=float, default=0.80)
     parser.add_argument("--assembly_redundancy_weight", type=float, default=0.45)
     parser.add_argument("--assembly_doc_penalty_weight", type=float, default=0.18)
+    parser.add_argument("--assembly_title_penalty_weight", type=float, default=1.40)
     parser.add_argument("--assembly_doc_fact_credit", type=float, default=0.75)
     parser.add_argument("--assembly_same_doc_penalty", type=float, default=0.10)
     parser.add_argument("--assembly_3hop_critical_multiplier", type=float, default=1.40)

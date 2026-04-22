@@ -10,6 +10,7 @@ from search_graph_decomposition_aware_modules.shared import (
     clamp_score,
     get_direct_support_threshold,
     has_negation,
+    is_title_sid,
 )
 
 
@@ -150,11 +151,20 @@ def score_negation_compatibility(profile, candidate_text):
 
 
 def score_bridge_features(sid, target_support, context, semantic_sim_map, args):
-    if not target_support["sids"] and not target_support["docids"] and not target_support["eids"] and not target_support["rids"]:
+    if (
+        not target_support["sids"]
+        and not target_support["docids"]
+        and not target_support["eids"]
+        and not target_support["rids"]
+        and not target_support.get("numbers")
+        and not target_support.get("time_tokens")
+        and not target_support.get("quantity_tokens")
+    ):
         return {
             "score": 0.0,
             "entity_overlap": 0.0,
             "relation_overlap": 0.0,
+            "constraint_overlap": 0.0,
             "same_doc": 0.0,
             "semantic": 0.0,
             "cross_doc": 0.0,
@@ -163,11 +173,23 @@ def score_bridge_features(sid, target_support, context, semantic_sim_map, args):
 
     sent_eids = context["sid2eids"].get(sid, set())
     sent_rids = context["sid2rids"].get(sid, set())
+    sent_numbers = context["sid2numbers"].get(sid, set())
+    sent_time_tokens = context["sid2time_tokens"].get(sid, set())
+    sent_quantity_tokens = context["sid2quantity_tokens"].get(sid, set())
     docid = context["sid2meta"].get(sid, {}).get("docid")
+    is_title = is_title_sid(context, sid)
 
     entity_overlap = 0.0 if not target_support["eids"] else len(sent_eids & target_support["eids"]) / max(1, len(target_support["eids"]))
     relation_overlap = 0.0 if not target_support["rids"] else len(sent_rids & target_support["rids"]) / max(1, len(target_support["rids"]))
     same_doc = 1.0 if docid and docid in target_support["docids"] else 0.0
+    constraint_parts = []
+    if target_support.get("numbers"):
+        constraint_parts.append(len(sent_numbers & target_support["numbers"]) / max(1, len(target_support["numbers"])))
+    if target_support.get("time_tokens"):
+        constraint_parts.append(len(sent_time_tokens & target_support["time_tokens"]) / max(1, len(target_support["time_tokens"])))
+    if target_support.get("quantity_tokens"):
+        constraint_parts.append(len(sent_quantity_tokens & target_support["quantity_tokens"]) / max(1, len(target_support["quantity_tokens"])))
+    constraint_overlap = sum(constraint_parts) / len(constraint_parts) if constraint_parts else 0.0
 
     semantic = 0.0
     for target_sid in target_support["sids"]:
@@ -175,13 +197,31 @@ def score_bridge_features(sid, target_support, context, semantic_sim_map, args):
 
     has_entity_bridge = bool(sent_eids & target_support["eids"])
     has_relation_bridge = bool(sent_rids & target_support["rids"])
-    cross_doc = 1.0 if docid and target_support["docids"] and docid not in target_support["docids"] and (has_entity_bridge or has_relation_bridge or semantic >= args.bridge_semantic_threshold) else 0.0
-    score = 0.40 * entity_overlap + 0.15 * relation_overlap + 0.20 * same_doc + 0.15 * semantic + 0.10 * cross_doc
-    satisfied = bool(same_doc or has_entity_bridge or has_relation_bridge or semantic >= args.bridge_semantic_threshold or cross_doc)
+    constraint_ready = constraint_overlap >= args.bridge_constraint_threshold
+    cross_doc = 1.0 if docid and target_support["docids"] and docid not in target_support["docids"] and (has_entity_bridge or has_relation_bridge or constraint_ready or semantic >= args.bridge_semantic_threshold) else 0.0
+    score = (
+        0.44 * entity_overlap
+        + 0.20 * relation_overlap
+        + 0.14 * constraint_overlap
+        + 0.10 * same_doc
+        + 0.06 * semantic
+        + 0.06 * cross_doc
+    )
+    if is_title:
+        score = max(0.0, score - args.title_bridge_penalty)
+    satisfied = bool(
+        has_entity_bridge
+        or has_relation_bridge
+        or constraint_ready
+        or semantic >= args.bridge_semantic_threshold
+        or cross_doc
+        or (same_doc and not is_title)
+    )
     return {
         "score": float(score),
         "entity_overlap": float(entity_overlap),
         "relation_overlap": float(relation_overlap),
+        "constraint_overlap": float(constraint_overlap),
         "same_doc": float(same_doc),
         "semantic": float(semantic),
         "cross_doc": float(cross_doc),

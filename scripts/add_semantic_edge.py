@@ -43,7 +43,7 @@ def build_hnsw_index(vectors, sids, k, ef):
     return edges
 
 def main(args):
-    nodes_path = args.nodes_path.replace('[SPLIT]', args.split)
+    nodes_path = args.nodes_path.replace('[SPLIT]', args.split).replace('[PLAN]', args.plan)
     with open(nodes_path, 'r') as f:
         nodes_data = json.load(f)
     print("Loaded nodes data.")
@@ -81,17 +81,18 @@ def main(args):
         edges = [e for e in edges if e['sim'] >= args.min_sim]
         semantic_edges.append({'id': node['id'], 'semantic_edges': edges})
     
-    semantic_edges_path = args.semantic_edges_path.replace('[SPLIT]', args.split)
+    semantic_edges_path = args.semantic_edges_path.replace('[SPLIT]', args.split).replace('[PLAN]', args.plan)
     with open(semantic_edges_path, 'w') as f:
         json.dump(semantic_edges, f, indent=4)
     print("Saved semantic edges.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--nodes_path', type=str, default='./data/bm25_nodes_[SPLIT].json')
-    parser.add_argument('--semantic_edges_path', type=str, default='./data/bm25_semantic_edges_[SPLIT].json')
+    parser.add_argument('--nodes_path', type=str, default='./data/[PLAN]/bm25_nodes_[SPLIT].json')
+    parser.add_argument('--semantic_edges_path', type=str, default='./data/[PLAN]/bm25_semantic_edges_[SPLIT].json')
     parser.add_argument('--split', type=str, default='dev')
-    
+    parser.add_argument('--plan', type=str, default='plan5.1')
+
     parser.add_argument('--embedding_model', type=str, default='sentence-transformers/all-MiniLM-L6-v2')
     parser.add_argument('--batch_size', type=int, default=64)
     

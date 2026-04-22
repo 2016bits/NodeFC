@@ -114,7 +114,7 @@ class RebelExtractor:
         return [extract_triples_from_rebel(output) for output in decoded_outputs]
     
 def main(args):
-    in_path = args.in_path.replace('[SPLIT]', args.split)
+    in_path = args.in_path.replace('[SPLIT]', args.split).replace('[PLAN]', args.plan)
     with open(in_path, 'r') as f:
         dataset = json.load(f)
     print("Loaded dataset with {} samples.".format(len(dataset)))
@@ -228,11 +228,11 @@ def main(args):
             'nrn_edges': nrn_edges,
         })
     
-    out_nodes_path = args.out_nodes_path.replace('[SPLIT]', args.split)
+    out_nodes_path = args.out_nodes_path.replace('[SPLIT]', args.split).replace('[PLAN]', args.plan)
     with open(out_nodes_path, 'w') as f:
         json.dump(nodes_list, f, indent=4)
 
-    out_edges_path = args.out_edges_path.replace('[SPLIT]', args.split)
+    out_edges_path = args.out_edges_path.replace('[SPLIT]', args.split).replace('[PLAN]', args.plan)
     with open(out_edges_path, 'w') as f:
         json.dump(edges_list, f, indent=4)
     
@@ -240,10 +240,11 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--in_path', type=str, default='./data/bm25_sentnodes_[SPLIT].json')
-    parser.add_argument('--out_nodes_path', type=str, default='./data/bm25_nodes_[SPLIT].json')
-    parser.add_argument('--out_edges_path', type=str, default='./data/bm25_edges_[SPLIT].json')
+    parser.add_argument('--in_path', type=str, default='./data/[PLAN]/bm25_sentnodes_[SPLIT].json')
+    parser.add_argument('--out_nodes_path', type=str, default='./data/[PLAN]/bm25_nodes_[SPLIT].json')
+    parser.add_argument('--out_edges_path', type=str, default='./data/[PLAN]/bm25_edges_[SPLIT].json')
     parser.add_argument('--split', type=str, default='dev')
+    parser.add_argument('--plan', type=str, default='plan5.1')
 
     parser.add_argument('--model', type=str, default='Babelscape/rebel-large')
     parser.add_argument('--batch_size', type=int, default=16)

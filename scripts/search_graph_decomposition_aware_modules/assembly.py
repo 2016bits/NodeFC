@@ -53,6 +53,29 @@ def build_global_candidate_view(fact_results, topk):
     return ranked[:topk]
 
 
+def _candidate_is_title(candidate, sentence_pool=None):
+    if not candidate:
+        return False
+    if "is_title" in candidate:
+        return bool(candidate.get("is_title", False))
+    sid = candidate.get("sid")
+    if sid is None or sentence_pool is None:
+        return False
+    return bool((sentence_pool.get(sid) or {}).get("is_title", False))
+
+
+def _assembly_candidate_sort_key(candidate, sentence_pool, args):
+    return (
+        0 if _candidate_is_title(candidate, sentence_pool) else 1,
+        candidate_rank_key(candidate),
+        -float(getattr(args, "assembly_title_penalty_weight", 0.0) or 0.0) if _candidate_is_title(candidate, sentence_pool) else 0.0,
+    )
+
+
+def _prioritize_assembly_candidates(candidates, sentence_pool, args):
+    return sorted(candidates or [], key=lambda cand: _assembly_candidate_sort_key(cand, sentence_pool, args), reverse=True)
+
+
 def _merge_sentence_pool_candidate(sentence_pool, fact_id, cand):
     sid = cand["sid"]
     item = sentence_pool.get(sid)
@@ -62,6 +85,7 @@ def _merge_sentence_pool_candidate(sentence_pool, fact_id, cand):
             "text": cand["text"],
             "docid": cand.get("docid"),
             "doc_rank": int(cand.get("doc_rank", 10**9)),
+            "is_title": bool(cand.get("is_title", False)),
             "score": float(cand["aggregate_score"]),
             "best_fact_score": float(cand["fact_score"]),
             "source_fact_ids": [],
@@ -74,6 +98,7 @@ def _merge_sentence_pool_candidate(sentence_pool, fact_id, cand):
         item["text"] = cand["text"]
         item["docid"] = cand.get("docid")
         item["doc_rank"] = int(cand.get("doc_rank", 10**9))
+        item["is_title"] = bool(cand.get("is_title", False))
         item["score"] = float(cand["aggregate_score"])
     item["best_fact_score"] = max(item["best_fact_score"], float(cand["fact_score"]))
     item["fact_support"][fact_id] = {
@@ -109,6 +134,8 @@ def _merge_sentence_pool_candidate(sentence_pool, fact_id, cand):
         "critical_coverage_bonus": float(cand["critical_coverage_bonus"]),
         "doc_rank_bonus": float(cand["doc_rank_bonus"]),
         "fact_completeness_penalty": float(cand.get("fact_completeness_penalty", 0.0)),
+        "is_title": bool(cand.get("is_title", False)),
+        "title_score_penalty": float(cand.get("title_score_penalty", 0.0)),
     }
 
 
@@ -248,6 +275,7 @@ def _compute_assembly_utility_components(state, fact_stats, args):
         "anchor_weight": float(args.assembly_anchor_satisfied_weight),
         "redundancy_weight": float(args.assembly_redundancy_weight),
         "doc_weight": float(args.assembly_doc_penalty_weight),
+        "title_weight": float(args.assembly_title_penalty_weight),
     }
 
 
@@ -260,6 +288,7 @@ def _compute_assembly_gain(current_state, trial_state, fact_stats, args):
     new_anchor_satisfied = len(trial_state["anchor_satisfied_facts"] - current_state["anchor_satisfied_facts"])
     new_redundancy = max(0.0, float(trial_state["redundancy"]) - float(current_state["redundancy"]))
     new_doc_penalty = max(0.0, float(trial_state["doc_penalty"]) - float(current_state["doc_penalty"]))
+    new_title_penalty = max(0.0, float(trial_state["title_penalty"]) - float(current_state["title_penalty"]))
     doc_fact_credit = args.assembly_doc_fact_credit * _count_new_fact_carrying_docs(current_state, trial_state)
     new_doc_penalty = max(0.0, new_doc_penalty - doc_fact_credit)
     gain = (
@@ -270,6 +299,7 @@ def _compute_assembly_gain(current_state, trial_state, fact_stats, args):
         + weights["anchor_weight"] * new_anchor_satisfied
         - weights["redundancy_weight"] * new_redundancy
         - weights["doc_weight"] * new_doc_penalty
+        - weights["title_weight"] * new_title_penalty
     )
     return {
         "gain": float(gain),
@@ -280,6 +310,7 @@ def _compute_assembly_gain(current_state, trial_state, fact_stats, args):
         "new_anchor_satisfied": int(new_anchor_satisfied),
         "new_redundancy": float(new_redundancy),
         "new_doc_penalty": float(new_doc_penalty),
+        "new_title_penalty": float(new_title_penalty),
         "doc_fact_credit": float(doc_fact_credit),
         "weights": weights,
     }
@@ -296,6 +327,7 @@ def _zero_bridge_eval():
         "same_doc": 0.0,
         "entity_overlap": 0.0,
         "relation_overlap": 0.0,
+        "constraint_overlap": 0.0,
         "semantic": 0.0,
         "cross_doc": 0.0,
         "satisfied": False,
@@ -306,6 +338,7 @@ def _sort_direct_support_items(items):
     return sorted(
         items,
         key=lambda x: (
+            0 if x[1].get("is_title") else 1,
             direct_support_tier_rank(x[1].get("direct_support_tier")),
             float(x[1].get("direct_support_score", 0.0)),
             float(x[1].get("fact_score", 0.0)),
@@ -320,6 +353,7 @@ def _sort_bridge_support_items(items):
     return sorted(
         items,
         key=lambda x: (
+            0 if x[1].get("is_title") else 1,
             float(x[1].get("bridge_support_score", 0.0)),
             float(x[1].get("binding_score", 0.0)),
             float(x[1].get("aggregate_score", 0.0)),
@@ -632,6 +666,7 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
 
     critical_covered = len(critical_covered_facts)
     doc_penalty = _compute_assembly_doc_penalty(selected_docs, fact_stats, args)
+    title_penalty = sum(1.0 for sid in selected_sids if sentence_pool.get(sid, {}).get("is_title"))
     utility_weights = _compute_assembly_utility_components({}, fact_stats, args)
     utility = 0.0
     utility += utility_weights["fact_weight"] * len(covered_facts)
@@ -641,6 +676,7 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
     utility += utility_weights["anchor_weight"] * len(anchor_satisfied_facts)
     utility -= utility_weights["redundancy_weight"] * redundancy
     utility -= utility_weights["doc_weight"] * doc_penalty
+    utility -= utility_weights["title_weight"] * title_penalty
 
     return {
         "utility": float(utility),
@@ -662,6 +698,7 @@ def evaluate_selected_set(selected_sids, sentence_pool, fact_sequence, fact_stat
         "docids": selected_docs,
         "doc_fact_map": {docid: set(fids) for docid, fids in doc_fact_map.items()},
         "doc_penalty": float(doc_penalty),
+        "title_penalty": float(title_penalty),
         "coverage_value": float(coverage_value),
         "redundancy": float(redundancy),
     }
@@ -723,6 +760,7 @@ def rescue_uncovered_facts(selected_sids, sentence_pool, fact_sequence, fact_sta
                 summary.get("direct_candidates") or [],
                 summary.get("bridge_candidates") or [],
             )
+            candidates = _prioritize_assembly_candidates(candidates, sentence_pool, args)
             if not candidates:
                 continue
 
@@ -777,6 +815,7 @@ def rescue_uncovered_facts(selected_sids, sentence_pool, fact_sequence, fact_sta
                     int(gain_info["new_bridge_closed"]),
                     int(gain_info["new_anchor_satisfied"]),
                     -float(gain_info["new_doc_penalty"]),
+                    -float(gain_info["new_title_penalty"]),
                     -float(gain_info["new_redundancy"]),
                     candidate_rank_key(cand),
                 )
@@ -848,8 +887,8 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
 
         fr = result_by_id.get(fid) or {}
         summary = fr.get("coverage_summary") or {}
-        direct_candidates = list(summary.get("direct_candidates") or [])
-        bridge_candidates = list(summary.get("bridge_candidates") or [])
+        direct_candidates = _prioritize_assembly_candidates(list(summary.get("direct_candidates") or []), sentence_pool, args)
+        bridge_candidates = _prioritize_assembly_candidates(list(summary.get("bridge_candidates") or []), sentence_pool, args)
         parent_support_sids = _collect_parent_support_sids(parents, fact_witnesses)
 
         chosen_direct = []
@@ -1108,6 +1147,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
             "text": item["text"],
             "docid": item.get("docid"),
             "doc_rank": int(item.get("doc_rank", 10**9)),
+            "is_title": bool(item.get("is_title", False)),
             "score": float(score),
             "fact_score": float(fact_score),
             "support_type": support_type,
@@ -1131,6 +1171,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
 
     selected.sort(
         key=lambda x: (
+            0 if x.get("is_title") else 1,
             direct_support_tier_rank(x.get("direct_support_tier")),
             1 if x.get("support_type") == "direct_support" else 0,
             float(x.get("direct_support_score", 0.0)),
@@ -1153,6 +1194,7 @@ def aggregate_top_evidences(fact_sequence, fact_results, fact_stats, context, se
         "anchor_satisfied": int(state["anchor_satisfied"]),
         "cross_doc_bridge_count": int(state["cross_doc_bridge_count"]),
         "doc_penalty": float(state["doc_penalty"]),
+        "title_penalty": float(state["title_penalty"]),
         "utility": float(state["utility"]),
         "redundancy": float(state["redundancy"]),
         "rescue_added": int(rescue_added),

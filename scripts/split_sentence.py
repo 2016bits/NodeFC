@@ -25,7 +25,7 @@ def split_into_sentences(title, text):
     return sentences
 
 def main(args):
-    in_path = args.in_path.replace('[SPLIT]', args.split)
+    in_path = args.in_path.replace('[SPLIT]', args.split).replace('[PLAN]', args.plan)
     with open(in_path, 'r') as f:
         dataset = json.load(f)
     
@@ -48,6 +48,7 @@ def main(args):
                     'doc_rank': rank,
                     'doc_score': score,
                     'sent_idx': sent_idx,
+                    'is_title': bool(sent_idx == 0),
                     'sentences': sent,
                 })
                 sid_counter += 1
@@ -59,16 +60,17 @@ def main(args):
             'sent_nodes': sent_nodes,
         })
     
-    out_path = args.out_path.replace('[SPLIT]', args.split)
+    out_path = args.out_path.replace('[SPLIT]', args.split).replace('[PLAN]', args.plan)
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=4)
     print(f"save path: {args.out_path}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--in_path', type=str, default='data/bm25_[SPLIT].json')
-    parser.add_argument('--out_path', type=str, default='data/bm25_sentnodes_[SPLIT].json')
+    parser.add_argument('--in_path', type=str, default='data/[PLAN]/bm25_[SPLIT].json')
+    parser.add_argument('--out_path', type=str, default='data/[PLAN]/bm25_sentnodes_[SPLIT].json')
     parser.add_argument('--split', type=str, default='dev')
+    parser.add_argument('--plan', type=str, default='plan5.1')
 
     args = parser.parse_args()
     main(args)
