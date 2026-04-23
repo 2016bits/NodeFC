@@ -1,10 +1,15 @@
 # retrieve with BM25
 ```bash
 python scripts/bm25_retrieve.py
-# dual-route coarse retrieval: claim BM25 + atomic-fact BM25
+# role-aware coarse retrieval:
+# claim BM25 + critical-fact BM25 + leaf/deep-fact BM25 + bridge/rely_on-fact BM25
+# docs are merged by fusion score and filtered with simple diversity constraints
 # if you already have decomposition results, pass --decomposition_path
 # example:
-# python scripts/bm25_retrieve.py --split dev --decomposition_path data/plan4.2/dev_2_decomposed_0_4000.json
+# python scripts/bm25_retrieve.py --split dev \
+#   --decomposition_path data/plan4.2/dev_2_decomposed_0_4000.json \
+#   --claim_topk 12 --critical_topk 8 --leaf_topk 6 --bridge_topk 6 \
+#   --final_topk 18 --max_docs_per_fact 2 --max_docs_per_cluster 2
 ```
 We can get retrieved documents: bm25_dev.json
 ```python
@@ -14,7 +19,19 @@ result = {
     'gold_evidence': gold_evidence[{"title", "index", "sentences"}]
     'label': label("SPPORTS"/"REFUTES"),
     'num_hops': num_hops,
-    'retrieved_docs': retrieved_docs[{"docid", "score", "text", "retrieval_routes", "matched_atomic_fact_ids"}],
+    'retrieved_docs': retrieved_docs[{
+        "docid", "score", "text",
+        "retrieval_routes",
+        "matched_atomic_fact_ids",
+        "matched_atomic_fact_roles",
+        "fusion_components",
+    }],
+    'retrieval_summary': {
+        "claim_topk", "critical_topk", "leaf_topk", "bridge_topk", "final_topk",
+        "fact_query_count_by_role",
+        "fusion_weights",
+        "diversity",
+    },
 }
 ```
 
