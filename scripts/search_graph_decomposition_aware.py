@@ -147,7 +147,14 @@ def main(args):
             "entry_nids": aggregate_entry_ids(fact_results, "entry_n", topk=args.max_export_entry_n),
             "entry_rids": aggregate_entry_ids(fact_results, "entry_r", topk=args.max_export_entry_r),
             "top_evidences": top_evidences,
-            "reranked_candidates": build_global_candidate_view(fact_results, topk=args.max_export_candidates),
+            "reranked_candidates": build_global_candidate_view(
+                fact_sequence,
+                fact_results,
+                fact_stats,
+                context["semantic_sim_map"],
+                args,
+                topk=args.max_export_candidates,
+            ),
             "fact_traces": fact_traces,
             "assembly_summary": assembly_summary,
         })
@@ -191,6 +198,11 @@ if __name__ == "__main__":
     parser.add_argument("--per_fact_output_k", type=int, default=12)
     parser.add_argument("--fact_trace_k", type=int, default=5)
     parser.add_argument("--max_evidence", type=int, default=8)
+    parser.add_argument("--rerank_keep_direct_per_fact", type=int, default=2)
+    parser.add_argument("--rerank_keep_bridge_per_fact", type=int, default=2)
+    parser.add_argument("--rerank_keep_critical_per_fact", type=int, default=3)
+    parser.add_argument("--rerank_keep_bypass_per_fact", type=int, default=1)
+    parser.add_argument("--rerank_keep_global", type=int, default=24)
 
     parser.add_argument("--w_entry_s", type=float, default=0.55)
     parser.add_argument("--w_entry_n", type=float, default=0.25)
@@ -262,6 +274,13 @@ if __name__ == "__main__":
     parser.add_argument("--min_context_independence_for_bridge_assisted_direct", type=float, default=0.08)
     parser.add_argument("--min_constraint_consistency_for_anchor", type=float, default=0.20)
     parser.add_argument("--min_keyword_overlap_for_critical_direct", type=float, default=0.05)
+    parser.add_argument("--rerank_weight_ce", type=float, default=0.34)
+    parser.add_argument("--rerank_weight_fact_match", type=float, default=0.22)
+    parser.add_argument("--rerank_weight_direct_support", type=float, default=0.22)
+    parser.add_argument("--rerank_weight_bridge_potential", type=float, default=0.14)
+    parser.add_argument("--rerank_weight_uncovered_fact_gain", type=float, default=0.20)
+    parser.add_argument("--rerank_weight_redundancy", type=float, default=0.18)
+    parser.add_argument("--rerank_same_doc_redundancy_penalty", type=float, default=0.18)
     parser.add_argument("--fact_completeness_penalty_weight", type=float, default=0.18)
     parser.add_argument("--penalty_entity_pair_floor", type=float, default=0.45)
     parser.add_argument("--penalty_entity_pair_weight", type=float, default=0.30)

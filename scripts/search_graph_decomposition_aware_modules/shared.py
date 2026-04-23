@@ -713,6 +713,7 @@ def candidate_rank_key(candidate):
         1 if candidate.get("support_type") == "direct_support" else 0,
         0 if candidate.get("is_title") else 1,
         float(candidate.get("direct_support_score", 0.0)),
+        float(candidate.get("rerank_score", candidate.get("aggregate_score", 0.0))),
         float(candidate.get("aggregate_score", 0.0)),
         float(candidate.get("fact_score", 0.0)),
         float(candidate.get("bridge_support_score", 0.0)),

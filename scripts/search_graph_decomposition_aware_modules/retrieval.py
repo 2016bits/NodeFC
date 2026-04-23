@@ -2,7 +2,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from search_graph_hopaware import make_personalization, norm_text, ppr
+from search_graph_hopaware import get_sim, make_personalization, norm_text, ppr
 
 from search_graph_decomposition_aware_modules.scoring import (
     compute_direct_support_tier,
@@ -286,6 +286,257 @@ def get_role_ranking_weights(fact_role):
     }
 
 
+def compute_fact_match_score(
+    fact_role,
+    target_match,
+    entity_pair,
+    relation_match,
+    keyword_overlap,
+    constraint_consistency,
+    negation_compatibility,
+):
+    if fact_role == "anchor":
+        weights = {
+            "target": 0.22,
+            "entity": 0.20,
+            "relation": 0.12,
+            "keyword": 0.12,
+            "constraint": 0.24,
+            "negation": 0.10,
+        }
+    elif fact_role == "bridge":
+        weights = {
+            "target": 0.20,
+            "entity": 0.24,
+            "relation": 0.18,
+            "keyword": 0.12,
+            "constraint": 0.10,
+            "negation": 0.06,
+        }
+    else:
+        weights = {
+            "target": 0.24,
+            "entity": 0.24,
+            "relation": 0.16,
+            "keyword": 0.14,
+            "constraint": 0.12,
+            "negation": 0.10,
+        }
+    return clamp_score(
+        weights["target"] * target_match
+        + weights["entity"] * entity_pair
+        + weights["relation"] * relation_match
+        + weights["keyword"] * keyword_overlap
+        + weights["constraint"] * max(0.0, constraint_consistency)
+        + weights["negation"] * max(0.0, negation_compatibility)
+    )
+
+
+def compute_bridge_potential_score(bridge, binding, bridge_support_score, dependency_norm, ppr_norm, dependency_closure_ready):
+    return clamp_score(
+        0.42 * max(0.0, bridge_support_score)
+        + 0.24 * max(0.0, bridge.get("score", 0.0))
+        + 0.18 * max(0.0, binding.get("score", 0.0))
+        + 0.08 * max(0.0, dependency_norm)
+        + 0.04 * max(0.0, ppr_norm)
+        + 0.04 * float(bool(dependency_closure_ready))
+    )
+
+
+def compute_uncovered_fact_gain(
+    fact,
+    fact_role,
+    candidate_coverage,
+    strong_direct_support_pass,
+    weak_direct_support_pass,
+    bridge_assisted_direct_pass,
+    bridge_support_pass,
+    fact_match_score,
+    bridge_potential_score,
+):
+    gain = 0.12 * fact_match_score + 0.10 * bridge_potential_score
+    if strong_direct_support_pass:
+        gain = max(gain, 1.0)
+    elif weak_direct_support_pass:
+        gain = max(gain, 0.84)
+    elif bridge_assisted_direct_pass:
+        gain = max(gain, 0.78 if candidate_coverage.get("closure_ready") else 0.70)
+    elif bridge_support_pass:
+        gain = max(gain, 0.60 if candidate_coverage.get("closure_ready") else 0.48)
+
+    if candidate_coverage.get("fully_covered"):
+        gain += 0.08
+    elif candidate_coverage.get("covered"):
+        gain += 0.04
+    if fact.get("critical"):
+        gain += 0.08
+    if fact_role == "bridge":
+        gain += 0.06 * bridge_potential_score
+    return clamp_score(gain)
+
+
+def _compute_local_redundancy_scores(scored_candidates, context, args):
+    if not scored_candidates:
+        return {}
+
+    semantic_sim_map = (context or {}).get("semantic_sim_map") or {}
+    ordered = sorted(scored_candidates, key=candidate_rank_key, reverse=True)
+    previous = []
+    redundancy_scores = {}
+    for cand in ordered:
+        max_sim = 0.0
+        same_doc = 0.0
+        for prev in previous:
+            if cand.get("docid") and cand.get("docid") == prev.get("docid"):
+                same_doc = 1.0
+            max_sim = max(max_sim, get_sim(semantic_sim_map, cand["sid"], prev["sid"]))
+        semantic_penalty = 0.0
+        if max_sim > args.redundancy_threshold:
+            semantic_penalty = (max_sim - args.redundancy_threshold) / max(1e-6, 1.0 - args.redundancy_threshold)
+        redundancy_scores[cand["sid"]] = clamp_score(
+            semantic_penalty + args.rerank_same_doc_redundancy_penalty * same_doc,
+            lower=0.0,
+            upper=1.0,
+        )
+        previous.append(cand)
+    return redundancy_scores
+
+
+def _candidate_keep_reason_priority(candidate):
+    reasons = set(candidate.get("rerank_keep_reasons") or [])
+    if "critical_supportive" in reasons:
+        return 4
+    if "bypass" in reasons:
+        return 3
+    if "direct_bucket" in reasons:
+        return 2
+    if "bridge_bucket" in reasons:
+        return 1
+    return 0
+
+
+def _fact_bridge_bucket_sort_key(candidate):
+    return (
+        1 if candidate.get("bridge_assisted_closure_rescue") else 0,
+        float(candidate.get("bridge_potential_score", candidate.get("bridge_support_score", 0.0))),
+        float(candidate.get("rerank_score", candidate.get("aggregate_score", 0.0))),
+        float(candidate.get("binding_score", 0.0)),
+        float(candidate.get("bridge_support_score", 0.0)),
+        candidate_rank_key(candidate),
+    )
+
+
+def _fact_critical_support_sort_key(candidate):
+    return (
+        1 if candidate.get("direct_support_pass") else 0,
+        float(candidate.get("direct_support_score", 0.0)),
+        float(candidate.get("fact_score", 0.0)),
+        float(candidate.get("uncovered_fact_gain", 0.0)),
+        float(candidate.get("bridge_support_score", 0.0)),
+        float(candidate.get("rerank_score", candidate.get("aggregate_score", 0.0))),
+        candidate_rank_key(candidate),
+    )
+
+
+def _add_bucket_candidates(selected_map, candidates, limit, reason):
+    if limit <= 0:
+        return
+    kept = 0
+    for cand in candidates:
+        sid = cand["sid"]
+        existing = selected_map.get(sid)
+        if existing is None:
+            item = dict(cand)
+            item["rerank_keep_reasons"] = list(item.get("rerank_keep_reasons") or [])
+            if reason not in item["rerank_keep_reasons"]:
+                item["rerank_keep_reasons"].append(reason)
+            if reason == "critical_supportive":
+                item["critical_supportive_candidate"] = True
+            selected_map[sid] = item
+            kept += 1
+        else:
+            reasons = list(existing.get("rerank_keep_reasons") or [])
+            if reason not in reasons:
+                reasons.append(reason)
+                existing["rerank_keep_reasons"] = reasons
+            if reason == "critical_supportive":
+                existing["critical_supportive_candidate"] = True
+        if kept >= limit:
+            break
+
+
+def select_fact_preserved_candidates(fact, fact_role, scored_candidates, coverage_summary, args):
+    if not scored_candidates:
+        return []
+
+    limit = min(len(scored_candidates), max(1, int(args.per_fact_output_k)))
+    ordered = sorted(scored_candidates, key=candidate_rank_key, reverse=True)
+    selected_map = {}
+
+    if fact.get("critical"):
+        critical_supportive = sorted(
+            [
+                cand for cand in ordered
+                if cand.get("direct_support_pass")
+                or cand.get("bridge_support_pass")
+                or cand.get("rerank_bypass_pass")
+            ],
+            key=_fact_critical_support_sort_key,
+            reverse=True,
+        )
+        _add_bucket_candidates(selected_map, critical_supportive, args.rerank_keep_critical_per_fact, "critical_supportive")
+
+    bypass_candidates = sorted(
+        [cand for cand in ordered if cand.get("rerank_bypass_pass")],
+        key=candidate_rank_key,
+        reverse=True,
+    )
+    _add_bucket_candidates(selected_map, bypass_candidates, args.rerank_keep_bypass_per_fact, "bypass")
+
+    direct_candidates = sorted(
+        list((coverage_summary or {}).get("direct_candidates") or [cand for cand in ordered if cand.get("direct_support_pass")]),
+        key=candidate_rank_key,
+        reverse=True,
+    )
+    _add_bucket_candidates(selected_map, direct_candidates, args.rerank_keep_direct_per_fact, "direct_bucket")
+
+    if fact_role == "bridge" or fact.get("rely_on"):
+        bridge_candidates = sorted(
+            [
+                cand for cand in ((coverage_summary or {}).get("bridge_candidates") or ordered)
+                if cand.get("bridge_support_pass")
+                or cand.get("bridge_assisted_closure_rescue")
+                or cand.get("dependency_closure_ready")
+            ],
+            key=_fact_bridge_bucket_sort_key,
+            reverse=True,
+        )
+        _add_bucket_candidates(selected_map, bridge_candidates, args.rerank_keep_bridge_per_fact, "bridge_bucket")
+
+    protected = sorted(
+        selected_map.values(),
+        key=lambda cand: (_candidate_keep_reason_priority(cand), candidate_rank_key(cand)),
+        reverse=True,
+    )
+    if len(protected) > limit:
+        protected = protected[:limit]
+        selected_map = {cand["sid"]: cand for cand in protected}
+
+    for cand in ordered:
+        if len(selected_map) >= limit:
+            break
+        if cand["sid"] in selected_map:
+            continue
+        item = dict(cand)
+        item["rerank_keep_reasons"] = list(item.get("rerank_keep_reasons") or [])
+        if not item["rerank_keep_reasons"]:
+            item["rerank_keep_reasons"].append("score_pool")
+        selected_map[item["sid"]] = item
+
+    final_candidates = sorted(selected_map.values(), key=candidate_rank_key, reverse=True)
+    return final_candidates[:limit]
+
+
 def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, context, args, critical_bonus):
     if not reranked:
         return []
@@ -440,11 +691,46 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             has_bridge_assisted_direct=bool(bridge_assisted_direct_pass),
         )
         coverage_gate_pass = bool(parents_covered and candidate_coverage["fully_covered"])
+        fact_match_score = compute_fact_match_score(
+            fact_role=fact_role,
+            target_match=target_match,
+            entity_pair=entity_pair,
+            relation_match=relation_match,
+            keyword_overlap=keyword_overlap,
+            constraint_consistency=constraint_consistency,
+            negation_compatibility=negation_compatibility,
+        )
+        bridge_potential_score = compute_bridge_potential_score(
+            bridge=bridge,
+            binding=binding,
+            bridge_support_score=bridge_support_score,
+            dependency_norm=dependency_norm,
+            ppr_norm=ppr_norm,
+            dependency_closure_ready=dependency_closure_ready,
+        )
+        uncovered_fact_gain = compute_uncovered_fact_gain(
+            fact=fact,
+            fact_role=fact_role,
+            candidate_coverage=candidate_coverage,
+            strong_direct_support_pass=strong_direct_support_pass,
+            weak_direct_support_pass=weak_direct_support_pass,
+            bridge_assisted_direct_pass=bridge_assisted_direct_pass,
+            bridge_support_pass=bridge_support_pass,
+            fact_match_score=fact_match_score,
+            bridge_potential_score=bridge_potential_score,
+        )
+        weak_direct_rescue = bool(weak_direct_support_pass)
+        bridge_assisted_closure_rescue = bool(
+            bridge_assisted_direct_pass
+            and parents_covered
+            and dependency_closure_ready
+        )
 
         item = dict(cand)
         item.update({
             "fact_id": fact["id"],
             "fact_role": fact_role,
+            "ce_norm": float(ce_norm),
             "semantic_relevance": float(semantic_relevance),
             "entity_target_match": float(target_match),
             "entity_pair_score": float(entity_pair),
@@ -476,12 +762,35 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
             "cross_doc_bridge_score": float(bridge["cross_doc"]),
             "coverage_score": float(coverage_score),
             "aggregate_score": float(aggregate_score),
+            "fact_match_score": float(fact_match_score),
+            "bridge_potential_score": float(bridge_potential_score),
+            "uncovered_fact_gain": float(uncovered_fact_gain),
             "coverage_gate_pass": bool(coverage_gate_pass),
             "fact_completeness_penalty": float(completeness_penalty),
             "is_title": bool(cand.get("is_title", False)),
             "title_score_penalty": float(title_score_penalty),
+            "redundancy_penalty": 0.0,
+            "rerank_score": float(aggregate_score),
+            "weak_direct_rescue": bool(weak_direct_rescue),
+            "bridge_assisted_closure_rescue": bool(bridge_assisted_closure_rescue),
+            "rerank_bypass_pass": bool(weak_direct_rescue or bridge_assisted_closure_rescue),
+            "critical_supportive_candidate": False,
+            "rerank_keep_reasons": [],
         })
         scored.append(item)
+
+    redundancy_scores = _compute_local_redundancy_scores(scored, context, args)
+    for item in scored:
+        redundancy_penalty = float(redundancy_scores.get(item["sid"], 0.0))
+        item["redundancy_penalty"] = redundancy_penalty
+        item["rerank_score"] = float(
+            args.rerank_weight_ce * float(item.get("ce_norm", 0.0))
+            + args.rerank_weight_fact_match * float(item.get("fact_match_score", 0.0))
+            + args.rerank_weight_direct_support * float(item.get("direct_support_score", 0.0))
+            + args.rerank_weight_bridge_potential * float(item.get("bridge_potential_score", 0.0))
+            + args.rerank_weight_uncovered_fact_gain * float(item.get("uncovered_fact_gain", 0.0))
+            - args.rerank_weight_redundancy * redundancy_penalty
+        )
 
     scored.sort(key=candidate_rank_key, reverse=True)
     return scored
@@ -924,8 +1233,45 @@ def merge_candidate_lists(*candidate_lists):
             if prev is None or candidate_rank_key(cand) > candidate_rank_key(prev):
                 merged[sid] = dict(cand)
             elif prev is not None:
-                for field in ("aggregate_score", "fact_score", "coverage_score", "direct_support_score", "bridge_support_score", "semantic_relevance"):
+                for field in (
+                    "aggregate_score",
+                    "rerank_score",
+                    "fact_score",
+                    "coverage_score",
+                    "direct_support_score",
+                    "bridge_support_score",
+                    "semantic_relevance",
+                    "fact_match_score",
+                    "bridge_potential_score",
+                    "uncovered_fact_gain",
+                    "ce_score",
+                    "ce_norm",
+                ):
                     prev[field] = max(float(prev.get(field, 0.0)), float(cand.get(field, 0.0)))
+                for field in (
+                    "direct_support_pass",
+                    "strong_direct_support_pass",
+                    "weak_direct_support_pass",
+                    "bridge_assisted_direct_pass",
+                    "bridge_support_pass",
+                    "dependency_closure_ready",
+                    "weak_direct_rescue",
+                    "bridge_assisted_closure_rescue",
+                    "rerank_bypass_pass",
+                    "critical_supportive_candidate",
+                ):
+                    prev[field] = bool(prev.get(field, False) or cand.get(field, False))
+                prev["direct_support_tier"] = max(
+                    [prev.get("direct_support_tier", "none"), cand.get("direct_support_tier", "none")],
+                    key=lambda tier: {"none": 0, "bridge_assisted": 1, "weak": 2, "strong": 3}.get(tier, 0),
+                )
+                if cand.get("support_type") == "direct_support" or prev.get("support_type") != "direct_support":
+                    prev["support_type"] = cand.get("support_type", prev.get("support_type"))
+                reasons = list(prev.get("rerank_keep_reasons") or [])
+                for reason in cand.get("rerank_keep_reasons") or []:
+                    if reason not in reasons:
+                        reasons.append(reason)
+                prev["rerank_keep_reasons"] = reasons
                 merged[sid] = prev
     return sorted(merged.values(), key=candidate_rank_key, reverse=True)
 
@@ -1111,6 +1457,7 @@ def retrieve_one_fact(
         len(coverage_summary.get("direct_winners") or []),
         len(coverage_summary.get("bridge_winners") or []),
     )
+    preserved_candidates = select_fact_preserved_candidates(fact, fact_role, scored, coverage_summary, args)
     return {
         "fact_id": fact["id"],
         "text": fact["text"],
@@ -1126,5 +1473,5 @@ def retrieve_one_fact(
         "coverage_summary": coverage_summary,
         "completion_steps": completion_steps,
         "support_profile": build_support_profile(support_seed_candidates, context, max_candidates=support_profile_k),
-        "candidates": scored[:args.per_fact_output_k],
+        "candidates": preserved_candidates,
     }
