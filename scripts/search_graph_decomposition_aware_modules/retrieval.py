@@ -186,60 +186,145 @@ def candidate_title_penalty(candidate, context, args, field_name):
     return float(getattr(args, field_name, 0.0) or 0.0)
 
 
-def seed_candidate_is_clean(candidate, args):
+def _seed_filter_targets(fact, profile, parent_results):
+    binding_requirements = derive_binding_requirements(fact, profile, parent_results)
+    core_eids = list(binding_requirements.get("eids") or [])
+    if not core_eids:
+        core_eids = [eid for eid, _ in top_score_items(profile.get("entry_n") or {}, 3)]
+
+    core_rids = list(binding_requirements.get("rids") or [])
+    if not core_rids:
+        core_rids = [rid for rid, _ in top_score_items(profile.get("entry_r") or {}, 3)]
+
+    return {
+        "core_eids": set(core_eids),
+        "entity_keywords": set(profile.get("entity_surface_keywords") or set()),
+        "core_rids": set(core_rids),
+        "relation_keywords": set(profile.get("relation_keywords") or set()),
+    }
+
+
+def _seed_has_core_entity(candidate, targets, context):
+    sid = candidate["sid"]
+    sent_eids = context["sid2eids"].get(sid, set())
+    sent_keywords = context["sid2keywords"].get(sid, set())
+    return bool(
+        (targets["core_eids"] and sent_eids & targets["core_eids"])
+        or (targets["entity_keywords"] and sent_keywords & targets["entity_keywords"])
+    )
+
+
+def _seed_has_relation_clue(candidate, targets, context, args):
+    sid = candidate["sid"]
+    sent_rids = context["sid2rids"].get(sid, set())
+    sent_keywords = context["sid2keywords"].get(sid, set())
+    relation_match = float(candidate.get("relation_match_score", 0.0))
+    relation_keyword_hit = bool(targets["relation_keywords"] and sent_keywords & targets["relation_keywords"])
+    relation_id_hit = bool(targets["core_rids"] and sent_rids & targets["core_rids"])
+    return bool(relation_id_hit or relation_keyword_hit or relation_match >= args.seed_min_relation_match)
+
+
+def primary_seed_candidate_is_clean(candidate, args):
+    if candidate.get("is_title"):
+        return False
+    if candidate.get("direct_support_tier") != "strong":
+        return False
+
+    return float(candidate.get("direct_support_score", 0.0)) >= args.seed_min_direct_support_score
+
+
+def secondary_seed_candidate_is_clean(candidate, fact, profile, parent_results, context, args):
     if candidate.get("is_title"):
         return False
 
-    entity_overlap = float(candidate.get("entity_pair_score", 0.0))
-    relation_match = float(candidate.get("relation_match_score", 0.0))
-    constraint_match = max(0.0, float(candidate.get("time_quantity_consistency", 0.0)))
-    binding_score = float(candidate.get("binding_score", 0.0))
-    direct_support_score = float(candidate.get("direct_support_score", 0.0))
-
-    shared_signal = (
-        entity_overlap >= args.seed_min_entity_overlap
-        or constraint_match >= args.seed_min_constraint_match
-        or (relation_match >= args.seed_min_relation_match and binding_score >= args.seed_min_binding_score)
-    )
-    if candidate.get("direct_support_pass"):
-        return shared_signal and direct_support_score >= args.seed_min_direct_support_score
-    if not candidate.get("bridge_support_pass"):
+    direct_tier = candidate.get("direct_support_tier")
+    if direct_tier not in {"weak", "bridge_assisted"} and not candidate.get("bridge_support_pass"):
         return False
-    return shared_signal and binding_score >= args.seed_min_binding_score
+
+    entity_overlap = float(candidate.get("entity_pair_score", 0.0))
+    binding_score = float(candidate.get("binding_score", 0.0))
+    bridge_support_score = float(candidate.get("bridge_support_score", 0.0))
+    targets = _seed_filter_targets(fact, profile, parent_results)
+
+    if entity_overlap < args.seed_min_entity_overlap:
+        return False
+    if not _seed_has_core_entity(candidate, targets, context):
+        return False
+    if not _seed_has_relation_clue(candidate, targets, context, args):
+        return False
+    return bool(
+        binding_score >= args.seed_min_binding_score
+        or bridge_support_score >= args.bridge_threshold
+    )
 
 
-def select_support_seed_candidates(direct_candidates, bridge_candidates, args):
-    filtered_direct = [cand for cand in direct_candidates if seed_candidate_is_clean(cand, args)]
-    filtered_bridge = [cand for cand in bridge_candidates if seed_candidate_is_clean(cand, args)]
+def _annotate_seed_candidate(candidate, seed_tier, seed_weight):
+    item = dict(candidate)
+    item["seed_tier"] = seed_tier
+    item["seed_weight"] = float(seed_weight)
+    return item
 
-    if filtered_direct:
-        return filtered_direct[:args.max_support_seed_candidates]
-    if filtered_bridge:
-        return filtered_bridge[:args.max_bridge_seed_candidates]
 
-    fallback_direct = [cand for cand in direct_candidates if not cand.get("is_title")]
+def select_support_seed_candidates(fact, profile, parent_results, direct_candidates, bridge_candidates, context, args):
+    primary = [
+        _annotate_seed_candidate(cand, "primary", args.primary_seed_weight)
+        for cand in direct_candidates
+        if primary_seed_candidate_is_clean(cand, args)
+    ][:args.max_support_seed_candidates]
+
+    secondary = [
+        _annotate_seed_candidate(cand, "secondary", args.secondary_seed_weight)
+        for cand in direct_candidates
+        if secondary_seed_candidate_is_clean(cand, fact, profile, parent_results, context, args)
+    ][:args.max_bridge_seed_candidates]
+
+    if not secondary:
+        secondary = [
+            _annotate_seed_candidate(cand, "secondary", args.secondary_seed_weight)
+            for cand in bridge_candidates
+            if secondary_seed_candidate_is_clean(cand, fact, profile, parent_results, context, args)
+        ][:args.max_bridge_seed_candidates]
+
+    if primary or secondary:
+        return primary, secondary
+
+    fallback_direct = [
+        _annotate_seed_candidate(cand, "primary", max(0.75, args.secondary_seed_weight))
+        for cand in direct_candidates
+        if not cand.get("is_title")
+    ]
     if fallback_direct:
-        return fallback_direct[:1]
-    fallback_bridge = [cand for cand in bridge_candidates if not cand.get("is_title")]
+        return fallback_direct[:1], []
+
+    fallback_bridge = [
+        _annotate_seed_candidate(cand, "secondary", args.secondary_seed_weight)
+        for cand in bridge_candidates
+        if not cand.get("is_title")
+    ]
     if fallback_bridge:
-        return fallback_bridge[:1]
+        return [], fallback_bridge[:1]
+
     if direct_candidates:
-        return direct_candidates[:1]
-    return bridge_candidates[:1]
+        return [_annotate_seed_candidate(direct_candidates[0], "primary", max(0.75, args.secondary_seed_weight))], []
+    if bridge_candidates:
+        return [], [_annotate_seed_candidate(bridge_candidates[0], "secondary", args.secondary_seed_weight)]
+    return [], []
 
 
-def select_chain_seed_candidates(scored_candidates, args):
+def select_chain_seed_candidates(fact, profile, parent_results, scored_candidates, context, args):
     ordered = sorted(scored_candidates or [], key=candidate_rank_key, reverse=True)
-    direct = [cand for cand in ordered if cand.get("direct_support_pass") and seed_candidate_is_clean(cand, args)]
-    if direct:
-        return direct[:args.chain_seed_k]
-    bridge = [cand for cand in ordered if cand.get("bridge_support_pass") and seed_candidate_is_clean(cand, args)]
-    if bridge:
-        return bridge[:min(args.chain_seed_k, args.max_bridge_seed_candidates)]
-    fallback = [cand for cand in ordered if not cand.get("is_title")]
-    if fallback:
-        return fallback[:1]
-    return ordered[:1]
+    direct = [cand for cand in ordered if cand.get("direct_support_pass")]
+    bridge = [cand for cand in ordered if cand.get("bridge_support_pass")]
+    primary, secondary = select_support_seed_candidates(
+        fact,
+        profile,
+        parent_results,
+        direct,
+        bridge,
+        context,
+        args,
+    )
+    return primary[:args.chain_seed_k], secondary[:args.max_bridge_seed_candidates]
 
 
 def get_role_ranking_weights(fact_role):
@@ -796,7 +881,7 @@ def enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, c
     return scored
 
 
-def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args):
+def build_fact_coverage_summary(fact, profile, fact_role, parent_results, scored_candidates, context, args):
     parent_covered = all((parent.get("coverage_summary") or {}).get("covered", False) for parent in parent_results)
     parent_summary = build_parent_support_summary(parent_results)
     direct_candidates = sorted([cand for cand in scored_candidates if cand.get("direct_support_pass")], key=candidate_rank_key, reverse=True)
@@ -843,7 +928,16 @@ def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidat
     direct_winner_budget = get_fact_direct_winner_budget(fact, fact_role)
     direct_winners = direct_candidates[:direct_winner_budget]
     bridge_winners = bridge_candidates[:1] if fact_role == "bridge" else []
-    support_seed_candidates = select_support_seed_candidates(direct_winners, bridge_winners, args)
+    primary_seed_candidates, secondary_seed_candidates = select_support_seed_candidates(
+        fact,
+        profile,
+        parent_results,
+        direct_candidates,
+        bridge_candidates,
+        context,
+        args,
+    )
+    support_seed_candidates = primary_seed_candidates + secondary_seed_candidates
 
     covered = bool(parent_covered and coverage_status["covered"])
     fully_covered = bool(parent_covered and coverage_status["fully_covered"])
@@ -902,12 +996,14 @@ def build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidat
         "bridge_candidates": bridge_candidates,
         "direct_winners": direct_winners,
         "bridge_winners": bridge_winners,
+        "primary_seed_candidates": primary_seed_candidates,
+        "secondary_seed_candidates": secondary_seed_candidates,
         "support_seed_candidates": support_seed_candidates,
     }
 
 
-def coverage_insufficient(fact, fact_role, parent_results, scored_candidates, args):
-    summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored_candidates, args)
+def coverage_insufficient(fact, profile, fact_role, parent_results, scored_candidates, context, args):
+    summary = build_fact_coverage_summary(fact, profile, fact_role, parent_results, scored_candidates, context, args)
     return bool(
         not summary["fully_covered"]
         or summary["needs_fact_completion"]
@@ -917,12 +1013,26 @@ def coverage_insufficient(fact, fact_role, parent_results, scored_candidates, ar
     )
 
 
-def build_chain_bridge_sentence_map(binding_requirements, parent_results, context, args):
+def has_clear_structural_bridge_constraints(fact, profile, parent_results):
+    binding_requirements = derive_binding_requirements(fact, profile, parent_results)
+    entity_ready = bool(binding_requirements["eids"] or profile["entry_n"])
+    relation_ready = bool(binding_requirements["rids"] or profile["entry_r"] or profile.get("relation_keywords"))
+    return bool(entity_ready and relation_ready)
+
+
+def build_chain_bridge_sentence_map(binding_requirements, parent_results, context, args, allow_semantic=False):
     scores = defaultdict(float)
     parent_summary = build_parent_support_summary(parent_results)
     for sid in context["sid_list"]:
         binding = score_binding_coverage(binding_requirements, {"sid": sid}, context)
-        bridge = score_bridge_features(sid, parent_summary, context, context["semantic_sim_map"], args)
+        bridge = score_bridge_features(
+            sid,
+            parent_summary,
+            context,
+            context["semantic_sim_map"],
+            args,
+            allow_semantic=allow_semantic,
+        )
         score = 0.38 * binding["score"] + 0.34 * bridge["score"] + 0.18 * bridge["constraint_overlap"] + 0.10 * bridge["cross_doc"]
         if score > 0:
             scores[sid] = score
@@ -935,27 +1045,36 @@ def build_chain_completion_entries(
     base_entry_s,
     base_entry_n,
     base_entry_r,
+    dep_entry_s,
+    dep_entry_n,
+    dep_entry_r,
     scored_candidates,
     claim_entry_s,
     claim_entry_n,
     parent_results,
     context,
     args,
+    structure_focus=False,
 ):
     expanded_s = defaultdict(float, base_entry_s)
     expanded_n = defaultdict(float, base_entry_n)
     expanded_r = defaultdict(float, base_entry_r)
     binding_requirements = derive_binding_requirements(fact, profile, parent_results)
-    parent_summary = build_parent_support_summary(parent_results)
 
-    for sid in parent_summary["sids"]:
-        expanded_s[sid] += args.chain_parent_sentence_weight
-    for eid in parent_summary["eids"]:
-        expanded_n[eid] += args.chain_parent_neighbor_weight
-    for rid in parent_summary["rids"]:
-        expanded_r[rid] += args.chain_parent_neighbor_weight
+    for sid, score in (dep_entry_s or {}).items():
+        expanded_s[sid] += args.chain_parent_sentence_weight * float(score)
+    for eid, score in (dep_entry_n or {}).items():
+        expanded_n[eid] += args.chain_parent_neighbor_weight * float(score)
+    for rid, score in (dep_entry_r or {}).items():
+        expanded_r[rid] += args.chain_parent_neighbor_weight * float(score)
 
-    for sid, score in build_chain_bridge_sentence_map(binding_requirements, parent_results, context, args).items():
+    for sid, score in build_chain_bridge_sentence_map(
+        binding_requirements,
+        parent_results,
+        context,
+        args,
+        allow_semantic=not structure_focus,
+    ).items():
         expanded_s[sid] += args.chain_binding_sentence_weight * float(score)
 
     for eid in binding_requirements["eids"]:
@@ -963,9 +1082,38 @@ def build_chain_completion_entries(
     for rid in binding_requirements["rids"]:
         expanded_r[rid] += args.chain_binding_anchor_weight
 
-    for cand in select_chain_seed_candidates(scored_candidates, args):
+    primary_seed_candidates, secondary_seed_candidates = select_chain_seed_candidates(
+        fact,
+        profile,
+        parent_results,
+        scored_candidates,
+        context,
+        args,
+    )
+    chain_seed_candidates = primary_seed_candidates + secondary_seed_candidates
+
+    for cand in primary_seed_candidates:
         if cand["bridge_score"] >= args.bridge_threshold or cand["binding_score"] >= args.binding_threshold or cand["fact_score"] >= args.fact_score_threshold:
-            seed_weight = 0.5 * max(cand["fact_score"], cand["bridge_score"], cand["binding_score"])
+            seed_weight = args.chain_primary_seed_weight * float(cand.get("seed_weight", 1.0)) * max(
+                cand["fact_score"],
+                cand["direct_support_score"],
+                cand["binding_score"],
+            )
+            if cand.get("is_title"):
+                seed_weight = max(0.0, seed_weight - args.title_bridge_penalty)
+            expanded_s[cand["sid"]] += seed_weight
+            for eid in context["sid2eids"].get(cand["sid"], set()):
+                expanded_n[eid] += 0.25 * seed_weight
+            for rid in context["sid2rids"].get(cand["sid"], set()):
+                expanded_r[rid] += 0.25 * seed_weight
+
+    for cand in secondary_seed_candidates:
+        if cand["bridge_score"] >= args.bridge_threshold or cand["binding_score"] >= args.binding_threshold or cand["fact_score"] >= args.fact_score_threshold:
+            seed_weight = args.chain_secondary_seed_weight * float(cand.get("seed_weight", 1.0)) * max(
+                cand["fact_score"],
+                cand["bridge_score"],
+                cand["binding_score"],
+            )
             if cand.get("is_title"):
                 seed_weight = max(0.0, seed_weight - args.title_bridge_penalty)
             expanded_s[cand["sid"]] += seed_weight
@@ -975,7 +1123,7 @@ def build_chain_completion_entries(
                 expanded_r[rid] += 0.25 * seed_weight
 
     if fact.get("critical"):
-        for cand in select_chain_seed_candidates(scored_candidates, args):
+        for cand in chain_seed_candidates:
             expanded_s[cand["sid"]] += args.chain_critical_seed_weight * cand["fact_score"]
         for eid, score in top_score_items(profile["entry_n"], 4):
             expanded_n[eid] += args.chain_critical_seed_weight * float(score)
@@ -988,6 +1136,60 @@ def build_chain_completion_entries(
                 expanded_n[eid] += args.chain_claim_weight * float(score)
 
     return dict(expanded_s), dict(expanded_n), dict(expanded_r)
+
+
+def _graph_bundle_variant(graph, variant):
+    if isinstance(graph, dict) and any(key in graph for key in ("structural", "local", "full")):
+        return graph.get(variant) or graph.get("full") or graph.get("local") or graph.get("structural") or {}
+    return graph or {}
+
+
+def _count_stage_hits(score_map, min_relative_score):
+    return sum(1 for score in (score_map or {}).values() if float(score) >= min_relative_score)
+
+
+def build_bridge_stage_ppr_scores(graph, personalization, topk, budget, structure_focus, args):
+    structural_graph = _graph_bundle_variant(graph, "structural")
+    local_graph = _graph_bundle_variant(graph, "local")
+    full_graph = _graph_bundle_variant(graph, "full")
+
+    structural_scores = normalize_sentence_node_scores(
+        ppr(structural_graph, personalization, alpha=args.ppr_alpha, max_iter=args.ppr_max_iter),
+        topk,
+    )
+    min_hits = min(max(1, budget), max(1, int(args.bridge_stage_min_hits)))
+    structural_ready = _count_stage_hits(structural_scores, args.bridge_stage_min_relative_score) >= min_hits
+
+    local_scores = {}
+    if not structure_focus or not structural_ready:
+        local_scores = normalize_sentence_node_scores(
+            ppr(local_graph, personalization, alpha=args.ppr_alpha, max_iter=args.ppr_max_iter),
+            topk,
+        )
+    local_ready = _count_stage_hits(local_scores, args.bridge_stage_min_relative_score) >= min_hits
+
+    semantic_scores = {}
+    if not structure_focus or (not structural_ready and not local_ready):
+        semantic_scores = normalize_sentence_node_scores(
+            ppr(full_graph, personalization, alpha=args.ppr_alpha, max_iter=args.ppr_max_iter),
+            topk,
+        )
+
+    combined_scores = topk_normalize(
+        merge_score_maps(
+            (args.ppr_structural_expand_weight, structural_scores),
+            (args.ppr_local_expand_weight if local_scores else 0.0, local_scores),
+            (args.ppr_semantic_expand_weight if semantic_scores else 0.0, semantic_scores),
+        ),
+        topk,
+    )
+    return combined_scores, {
+        "structural": structural_scores,
+        "local": local_scores,
+        "semantic": semantic_scores,
+        "structural_ready": bool(structural_ready),
+        "local_ready": bool(local_ready),
+    }
 
 
 def build_targeted_fact_completion_candidates(
@@ -1047,30 +1249,42 @@ def build_targeted_dependency_completion_candidates(
         return []
     budget = args.bridge_repair_candidate_k
     topk = max(budget * 2, args.chain_seed_k)
+    structure_focus = has_clear_structural_bridge_constraints(fact, profile, parent_results)
     bridge_lexical = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="bridge", topk=topk)
     query_text = build_bridge_repair_query_text(fact, profile, parent_results, context)
     bridge_dense = topk_normalize(semantic_entry_from_bank(biencoder, query_text, sentence_bank, topk=topk), topk)
 
-    dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
+    dep_entry_s, dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
     exp_s, exp_n, exp_r = build_chain_completion_entries(
         fact,
         profile,
         bridge_lexical,
         merge_score_maps((1.0, profile["entry_n"]), (args.dependency_seed_weight, dep_entry_n)),
         merge_score_maps((1.0, profile["entry_r"]), (args.dependency_seed_weight, dep_entry_r)),
+        dep_entry_s,
+        dep_entry_n,
+        dep_entry_r,
         scored_candidates,
         claim_entry_s,
         claim_entry_n,
         parent_results,
         context,
         args,
+        structure_focus=structure_focus,
     )
     exp_personalization = make_personalization(exp_s, exp_n, exp_r, w_s=args.w_entry_s, w_n=args.w_entry_n, w_r=args.w_entry_r)
-    ppr_scores = normalize_sentence_node_scores(ppr(graph, exp_personalization, alpha=args.ppr_alpha, max_iter=args.ppr_max_iter), topk)
+    ppr_scores, _ppr_debug = build_bridge_stage_ppr_scores(
+        graph,
+        exp_personalization,
+        topk,
+        budget,
+        structure_focus,
+        args,
+    )
     combined = merge_score_maps(
         (args.bridge_repair_lexical_weight, bridge_lexical),
         (args.bridge_repair_dense_weight, bridge_dense),
-        (args.ppr_expand_weight, ppr_scores),
+        (1.0, ppr_scores),
     )
     candidates = select_sentence_candidates(
         context,
@@ -1110,26 +1324,38 @@ def build_targeted_cross_doc_bridge_candidates(
     parent_summary = build_parent_support_summary(parent_results)
     budget = args.bridge_repair_candidate_k
     topk = max(budget * 2, args.chain_seed_k)
+    structure_focus = has_clear_structural_bridge_constraints(fact, profile, parent_results)
     bridge_lexical = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="bridge", topk=topk)
     query_text = build_bridge_repair_query_text(fact, profile, parent_results, context)
     bridge_dense = topk_normalize(semantic_entry_from_bank(biencoder, query_text, sentence_bank, topk=topk), topk)
 
-    dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
+    dep_entry_s, dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
     exp_s, exp_n, exp_r = build_chain_completion_entries(
         fact,
         profile,
         bridge_lexical,
         merge_score_maps((1.0, profile["entry_n"]), (args.dependency_seed_weight, dep_entry_n)),
         merge_score_maps((1.0, profile["entry_r"]), (args.dependency_seed_weight, dep_entry_r)),
+        dep_entry_s,
+        dep_entry_n,
+        dep_entry_r,
         scored_candidates,
         claim_entry_s,
         claim_entry_n,
         parent_results,
         context,
         args,
+        structure_focus=structure_focus,
     )
     exp_personalization = make_personalization(exp_s, exp_n, exp_r, w_s=args.w_entry_s, w_n=args.w_entry_n, w_r=args.w_entry_r)
-    ppr_scores = normalize_sentence_node_scores(ppr(graph, exp_personalization, alpha=args.ppr_alpha, max_iter=args.ppr_max_iter), topk)
+    ppr_scores, _ppr_debug = build_bridge_stage_ppr_scores(
+        graph,
+        exp_personalization,
+        topk,
+        budget,
+        structure_focus,
+        args,
+    )
     cross_doc_bias = topk_normalize({
         sid: 1.0
         for sid in context["sid_list"]
@@ -1139,7 +1365,7 @@ def build_targeted_cross_doc_bridge_candidates(
     combined = merge_score_maps(
         (args.bridge_repair_lexical_weight, bridge_lexical),
         (args.bridge_repair_dense_weight, bridge_dense),
-        (args.ppr_expand_weight, ppr_scores),
+        (1.0, ppr_scores),
         (args.cross_doc_completion_weight, cross_doc_bias),
     )
     candidates = select_sentence_candidates(
@@ -1316,7 +1542,7 @@ def retrieve_one_fact(
     constraint_entry_s = build_constraint_entry(profile, biencoder, sentence_bank, topk=max(args.constraint_k, candidate_k))
     dependency_entry_s = build_sentence_recall_entry(fact, profile, fact_role, parent_results, context, args, mode="bridge", topk=max(args.constraint_k, candidate_k)) if parent_results or fact_role == "bridge" else {}
 
-    dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
+    _dep_entry_s, dep_entry_n, dep_entry_r = build_dependency_seed_maps(parent_results)
     entry_s = merge_score_maps(
         (args.initial_dense_weight, base_entry_s),
         (args.initial_lexical_weight, lexical_entry_s),
@@ -1350,7 +1576,7 @@ def retrieve_one_fact(
     rerank_query_text = build_fact_rerank_query_text(fact, profile, fact_role, parent_results, context)
     reranked = rerank_cross_encoder(crossencoder, rerank_query_text, local_candidates)
     scored = enrich_fact_candidates(fact, profile, fact_role, reranked, parent_results, context, args, critical_bonus)
-    coverage_summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored, args)
+    coverage_summary = build_fact_coverage_summary(fact, profile, fact_role, parent_results, scored, context, args)
 
     expanded = False
     completion_scored = []
@@ -1449,13 +1675,15 @@ def retrieve_one_fact(
 
     if completion_scored:
         scored = merge_candidate_lists(scored, completion_scored)
-        coverage_summary = build_fact_coverage_summary(fact, fact_role, parent_results, scored, args)
+        coverage_summary = build_fact_coverage_summary(fact, profile, fact_role, parent_results, scored, context, args)
 
     support_seed_candidates = coverage_summary["support_seed_candidates"] if coverage_summary["support_seed_candidates"] else scored
     support_profile_k = max(
         args.parent_support_k,
         len(coverage_summary.get("direct_winners") or []),
         len(coverage_summary.get("bridge_winners") or []),
+        len(coverage_summary.get("primary_seed_candidates") or []),
+        len(coverage_summary.get("secondary_seed_candidates") or []),
     )
     preserved_candidates = select_fact_preserved_candidates(fact, fact_role, scored, coverage_summary, args)
     return {

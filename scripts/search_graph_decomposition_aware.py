@@ -60,24 +60,68 @@ def main(args):
         context["semantic_sim_map"] = build_semantic_sim_map(id2semantic.get(ex_id, []), min_sen_sim=args.min_sen_sim)
         sentence_bank = encode_sentence_bank(biencoder, context)
 
-        graph = build_hetero_graph(
-            context["sent_nodes"],
-            context["entity_nodes"],
-            context["relation_nodes"],
-            context["sn_edges"],
-            context["sr_edges"],
-            context["nrn_edges"],
-            semantic_edges=id2semantic.get(ex_id, []),
-            w_sn=args.w_sn,
-            w_sr=args.w_sr,
-            w_nrn=args.w_nrn,
-            w_ss=args.w_ss,
-            min_sen_sim=args.min_sen_sim,
-            w_ss_entity_bonus=args.w_ss_entity_bonus,
-            w_ss_relation_bonus=args.w_ss_relation_bonus,
-            w_ss_number_bonus=args.w_ss_number_bonus,
-            w_ss_title_penalty=args.w_ss_title_penalty,
-        )
+        graph = {
+            "structural": build_hetero_graph(
+                context["sent_nodes"],
+                context["entity_nodes"],
+                context["relation_nodes"],
+                context["sn_edges"],
+                context["sr_edges"],
+                context["nrn_edges"],
+                semantic_edges=id2semantic.get(ex_id, []),
+                w_sn=args.w_sn,
+                w_sr=args.w_sr,
+                w_nrn=args.w_nrn,
+                w_ss_local=0.0,
+                w_ss_semantic=0.0,
+                local_sentence_window=args.local_sentence_window,
+                min_sen_sim=args.min_sen_sim,
+                w_ss_entity_bonus=args.w_ss_entity_bonus,
+                w_ss_relation_bonus=args.w_ss_relation_bonus,
+                w_ss_number_bonus=args.w_ss_number_bonus,
+                w_ss_title_penalty=args.w_ss_title_penalty,
+            ),
+            "local": build_hetero_graph(
+                context["sent_nodes"],
+                context["entity_nodes"],
+                context["relation_nodes"],
+                context["sn_edges"],
+                context["sr_edges"],
+                context["nrn_edges"],
+                semantic_edges=id2semantic.get(ex_id, []),
+                w_sn=args.w_sn,
+                w_sr=args.w_sr,
+                w_nrn=args.w_nrn,
+                w_ss_local=args.w_ss_local,
+                w_ss_semantic=0.0,
+                local_sentence_window=args.local_sentence_window,
+                min_sen_sim=args.min_sen_sim,
+                w_ss_entity_bonus=args.w_ss_entity_bonus,
+                w_ss_relation_bonus=args.w_ss_relation_bonus,
+                w_ss_number_bonus=args.w_ss_number_bonus,
+                w_ss_title_penalty=args.w_ss_title_penalty,
+            ),
+            "full": build_hetero_graph(
+                context["sent_nodes"],
+                context["entity_nodes"],
+                context["relation_nodes"],
+                context["sn_edges"],
+                context["sr_edges"],
+                context["nrn_edges"],
+                semantic_edges=id2semantic.get(ex_id, []),
+                w_sn=args.w_sn,
+                w_sr=args.w_sr,
+                w_nrn=args.w_nrn,
+                w_ss_local=args.w_ss_local,
+                w_ss_semantic=args.w_ss_semantic,
+                local_sentence_window=args.local_sentence_window,
+                min_sen_sim=args.min_sen_sim,
+                w_ss_entity_bonus=args.w_ss_entity_bonus,
+                w_ss_relation_bonus=args.w_ss_relation_bonus,
+                w_ss_number_bonus=args.w_ss_number_bonus,
+                w_ss_title_penalty=args.w_ss_title_penalty,
+            ),
+        }
 
         claim = sample["claim"]
         claim_entry_s = semantic_entry_from_bank(biencoder, claim, sentence_bank, topk=args.claim_entry_k)
@@ -222,6 +266,9 @@ if __name__ == "__main__":
     parser.add_argument("--w_sr", type=float, default=0.6)
     parser.add_argument("--w_nrn", type=float, default=1.0)
     parser.add_argument("--w_ss", type=float, default=0.6)
+    parser.add_argument("--w_ss_local", type=float, default=None)
+    parser.add_argument("--w_ss_semantic", type=float, default=None)
+    parser.add_argument("--local_sentence_window", type=int, default=2)
     parser.add_argument("--min_sen_sim", type=float, default=0.25)
     parser.add_argument("--w_ss_entity_bonus", type=float, default=0.20)
     parser.add_argument("--w_ss_relation_bonus", type=float, default=0.14)
@@ -306,6 +353,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed_min_direct_support_score", type=float, default=0.55)
     parser.add_argument("--max_support_seed_candidates", type=int, default=2)
     parser.add_argument("--max_bridge_seed_candidates", type=int, default=1)
+    parser.add_argument("--primary_seed_weight", type=float, default=1.00)
+    parser.add_argument("--secondary_seed_weight", type=float, default=0.35)
     parser.add_argument("--title_recall_penalty", type=float, default=0.12)
     parser.add_argument("--title_candidate_recall_penalty", type=float, default=0.08)
     parser.add_argument("--title_score_penalty", type=float, default=0.18)
@@ -316,10 +365,17 @@ if __name__ == "__main__":
     parser.add_argument("--chain_parent_neighbor_weight", type=float, default=0.35)
     parser.add_argument("--chain_binding_sentence_weight", type=float, default=0.50)
     parser.add_argument("--chain_binding_anchor_weight", type=float, default=0.65)
+    parser.add_argument("--chain_primary_seed_weight", type=float, default=0.52)
+    parser.add_argument("--chain_secondary_seed_weight", type=float, default=0.22)
     parser.add_argument("--chain_critical_seed_weight", type=float, default=0.45)
     parser.add_argument("--chain_claim_weight", type=float, default=0.18)
     parser.add_argument("--cross_doc_completion_weight", type=float, default=0.55)
     parser.add_argument("--anchor_completion_weight", type=float, default=0.95)
+    parser.add_argument("--ppr_structural_expand_weight", type=float, default=None)
+    parser.add_argument("--ppr_local_expand_weight", type=float, default=None)
+    parser.add_argument("--ppr_semantic_expand_weight", type=float, default=None)
+    parser.add_argument("--bridge_stage_min_relative_score", type=float, default=0.25)
+    parser.add_argument("--bridge_stage_min_hits", type=int, default=3)
 
     parser.add_argument("--assembly_candidates_per_fact", type=int, default=6)
     parser.add_argument("--base_max_docs_per_claim", type=int, default=2)
@@ -354,4 +410,14 @@ if __name__ == "__main__":
     parser.add_argument("--max_export_entry_r", type=int, default=24)
     parser.add_argument("--max_export_candidates", type=int, default=64)
     args = parser.parse_args()
+    if args.w_ss_local is None:
+        args.w_ss_local = float(args.w_ss)
+    if args.w_ss_semantic is None:
+        args.w_ss_semantic = 0.35 * float(args.w_ss)
+    if args.ppr_structural_expand_weight is None:
+        args.ppr_structural_expand_weight = float(args.ppr_expand_weight)
+    if args.ppr_local_expand_weight is None:
+        args.ppr_local_expand_weight = 0.55 * float(args.ppr_expand_weight)
+    if args.ppr_semantic_expand_weight is None:
+        args.ppr_semantic_expand_weight = 0.28 * float(args.ppr_expand_weight)
     main(args)

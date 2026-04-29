@@ -605,15 +605,35 @@ def build_constraint_entry(profile, biencoder, sentence_bank, topk):
 
 
 def build_dependency_seed_maps(parent_results):
+    dep_entry_s = defaultdict(float)
     dep_entry_n = defaultdict(float)
     dep_entry_r = defaultdict(float)
     for parent in parent_results:
         support = parent.get("support_profile") or {}
+        sentence_scores = support.get("seed_sentence_scores") or {}
+        entity_scores = support.get("seed_entity_scores") or {}
+        relation_scores = support.get("seed_relation_scores") or {}
+
+        if sentence_scores or entity_scores or relation_scores:
+            for sid, score in sentence_scores.items():
+                dep_entry_s[sid] += float(score)
+            for eid, score in entity_scores.items():
+                dep_entry_n[eid] += float(score)
+            for rid, score in relation_scores.items():
+                dep_entry_r[rid] += float(score)
+            continue
+
+        for sid in support.get("sids", []):
+            dep_entry_s[sid] += 1.0
         for eid in support.get("eids", []):
             dep_entry_n[eid] += 1.0
         for rid in support.get("rids", []):
             dep_entry_r[rid] += 1.0
-    return topk_normalize(dep_entry_n, 32), topk_normalize(dep_entry_r, 24)
+    return (
+        topk_normalize(dep_entry_s, 24),
+        topk_normalize(dep_entry_n, 32),
+        topk_normalize(dep_entry_r, 24),
+    )
 
 
 def build_support_profile(candidates, context, max_candidates):
@@ -625,8 +645,23 @@ def build_support_profile(candidates, context, max_candidates):
         "numbers": set(),
         "time_tokens": set(),
         "quantity_tokens": set(),
+        "primary_sids": set(),
+        "secondary_sids": set(),
+        "seed_sentence_scores": {},
+        "seed_entity_scores": {},
+        "seed_relation_scores": {},
     }
-    ordered = sorted(candidates or [], key=candidate_rank_key, reverse=True)
+    ordered = sorted(
+        candidates or [],
+        key=lambda cand: (
+            1 if cand.get("seed_tier") == "primary" else 0,
+            candidate_rank_key(cand),
+        ),
+        reverse=True,
+    )
+    seed_sentence_scores = defaultdict(float)
+    seed_entity_scores = defaultdict(float)
+    seed_relation_scores = defaultdict(float)
     kept = 0
     for cand in ordered:
         sid = cand["sid"]
@@ -637,13 +672,29 @@ def build_support_profile(candidates, context, max_candidates):
             continue
         if kept >= max_candidates:
             break
+
+        seed_tier = cand.get("seed_tier", "primary")
+        seed_weight = float(cand.get("seed_weight", 1.0))
         profile["sids"].add(sid)
         profile["eids"].update(context["sid2eids"].get(sid, set()))
         profile["rids"].update(context["sid2rids"].get(sid, set()))
         profile["numbers"].update(context["sid2numbers"].get(sid, set()))
         profile["time_tokens"].update(context["sid2time_tokens"].get(sid, set()))
         profile["quantity_tokens"].update(context["sid2quantity_tokens"].get(sid, set()))
+        if seed_tier == "primary":
+            profile["primary_sids"].add(sid)
+        else:
+            profile["secondary_sids"].add(sid)
+        seed_sentence_scores[sid] = max(seed_sentence_scores[sid], seed_weight)
+        for eid in context["sid2eids"].get(sid, set()):
+            seed_entity_scores[eid] += seed_weight
+        for rid in context["sid2rids"].get(sid, set()):
+            seed_relation_scores[rid] += seed_weight
         kept += 1
+
+    profile["seed_sentence_scores"] = dict(seed_sentence_scores)
+    profile["seed_entity_scores"] = dict(seed_entity_scores)
+    profile["seed_relation_scores"] = dict(seed_relation_scores)
     return profile
 
 

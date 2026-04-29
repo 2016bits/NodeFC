@@ -265,10 +265,62 @@ def add_edge(graph, src, dst, weight):
         return
     graph[src].append((dst, weight))
 
+def _collect_local_sentence_pairs(sent_nodes, local_sentence_window):
+    if local_sentence_window <= 0:
+        return []
+
+    doc2items = defaultdict(list)
+    for sent in sent_nodes or []:
+        sid = sent.get("sid")
+        docid = sent.get("docid")
+        sent_idx = sent.get("sent_idx", None)
+        if sid is None or docid is None or sent_idx is None:
+            continue
+        try:
+            doc2items[str(docid)].append((int(sent_idx), str(sid)))
+        except (TypeError, ValueError):
+            continue
+
+    pairs = []
+    for items in doc2items.values():
+        items = sorted(items, key=lambda x: x[0])
+        for i, (idx_i, sid_i) in enumerate(items):
+            for j in range(i + 1, min(len(items), i + 1 + local_sentence_window)):
+                idx_j, sid_j = items[j]
+                distance = max(1, idx_j - idx_i)
+                proximity = 1.0 / float(distance)
+                pairs.append((sid_i, sid_j, proximity))
+    return pairs
+
+
+def _compute_sentence_structure_bonus(sid1, sid2, sid2eids, sid2rids, sid2numbers, w_ss_entity_bonus, w_ss_relation_bonus, w_ss_number_bonus):
+    shared_entity = 0.0
+    if sid2eids.get(sid1) and sid2eids.get(sid2):
+        shared_entity = len(sid2eids[sid1] & sid2eids[sid2]) / max(1, min(len(sid2eids[sid1]), len(sid2eids[sid2])))
+
+    shared_relation = 0.0
+    if sid2rids.get(sid1) and sid2rids.get(sid2):
+        shared_relation = len(sid2rids[sid1] & sid2rids[sid2]) / max(1, min(len(sid2rids[sid1]), len(sid2rids[sid2])))
+
+    shared_number = 0.0
+    if sid2numbers.get(sid1) and sid2numbers.get(sid2):
+        shared_number = len(sid2numbers[sid1] & sid2numbers[sid2]) / max(1, min(len(sid2numbers[sid1]), len(sid2numbers[sid2])))
+
+    return (
+        1.0
+        + w_ss_entity_bonus * shared_entity
+        + w_ss_relation_bonus * shared_relation
+        + w_ss_number_bonus * shared_number
+    )
+
+
 def build_hetero_graph(sent_nodes, entity_nodes, relation_nodes,
                        sn_edges, sr_edges, nrn_edges,
-                       semantic_edges=[],
+                       semantic_edges=None,
                        w_sn=1.0, w_sr=0.6, w_nrn=1.0, w_ss=0.5,
+                       w_ss_local=None,
+                       w_ss_semantic=None,
+                       local_sentence_window=2,
                        min_sen_sim=0.25,
                        w_ss_entity_bonus=0.20,
                        w_ss_relation_bonus=0.14,
@@ -285,6 +337,11 @@ def build_hetero_graph(sent_nodes, entity_nodes, relation_nodes,
         text = sent.get("sentences") or sent.get("text") or ""
         sid2numbers[sid] = extract_numbers(text)
         sid2is_title[sid] = bool(sent.get("is_title", int(sent.get("sent_idx", -1)) == 0))
+
+    if w_ss_local is None:
+        w_ss_local = float(w_ss)
+    if w_ss_semantic is None:
+        w_ss_semantic = 0.35 * float(w_ss)
     
     # S-N edges
     for edge in sn_edges:
@@ -312,8 +369,28 @@ def build_hetero_graph(sent_nodes, entity_nodes, relation_nodes,
         add_edge(graph, t, r, w_nrn)
         add_edge(graph, r, t, w_nrn)
     
-    # Semantic S-S edges
-    if semantic_edges:
+    # Local S-S edges: nearby sentences in the same document carry stronger evidence than pure semantic neighbors.
+    if w_ss_local > 0 and local_sentence_window > 0:
+        for sid1, sid2, proximity in _collect_local_sentence_pairs(sent_nodes, local_sentence_window):
+            u = f"S::{sid1}"
+            v = f"S::{sid2}"
+            structure_bonus = _compute_sentence_structure_bonus(
+                sid1,
+                sid2,
+                sid2eids,
+                sid2rids,
+                sid2numbers,
+                w_ss_entity_bonus,
+                w_ss_relation_bonus,
+                w_ss_number_bonus,
+            )
+            title_penalty = 1.0 - w_ss_title_penalty if (sid2is_title.get(sid1) or sid2is_title.get(sid2)) else 1.0
+            w = float(w_ss_local) * float(proximity) * structure_bonus * max(0.0, title_penalty)
+            add_edge(graph, u, v, w)
+            add_edge(graph, v, u, w)
+
+    # Semantic S-S edges: pure embedding neighbors stay weaker and only supplement structural/local chains.
+    if semantic_edges and w_ss_semantic > 0:
         for edge in semantic_edges:
             sim = float(edge.get('sim', 0.0))
             if sim < min_sen_sim:
@@ -326,23 +403,18 @@ def build_hetero_graph(sent_nodes, entity_nodes, relation_nodes,
             sid2 = str(sid2_raw)
             u = f"S::{sid1}"
             v = f"S::{sid2}"
-            shared_entity = 0.0
-            if sid2eids.get(sid1) and sid2eids.get(sid2):
-                shared_entity = len(sid2eids[sid1] & sid2eids[sid2]) / max(1, min(len(sid2eids[sid1]), len(sid2eids[sid2])))
-            shared_relation = 0.0
-            if sid2rids.get(sid1) and sid2rids.get(sid2):
-                shared_relation = len(sid2rids[sid1] & sid2rids[sid2]) / max(1, min(len(sid2rids[sid1]), len(sid2rids[sid2])))
-            shared_number = 0.0
-            if sid2numbers.get(sid1) and sid2numbers.get(sid2):
-                shared_number = len(sid2numbers[sid1] & sid2numbers[sid2]) / max(1, min(len(sid2numbers[sid1]), len(sid2numbers[sid2])))
-            structure_bonus = (
-                1.0
-                + w_ss_entity_bonus * shared_entity
-                + w_ss_relation_bonus * shared_relation
-                + w_ss_number_bonus * shared_number
+            structure_bonus = _compute_sentence_structure_bonus(
+                sid1,
+                sid2,
+                sid2eids,
+                sid2rids,
+                sid2numbers,
+                w_ss_entity_bonus,
+                w_ss_relation_bonus,
+                w_ss_number_bonus,
             )
             title_penalty = 1.0 - w_ss_title_penalty if (sid2is_title.get(sid1) or sid2is_title.get(sid2)) else 1.0
-            w = w_ss * sim * structure_bonus * max(0.0, title_penalty)
+            w = float(w_ss_semantic) * sim * structure_bonus * max(0.0, title_penalty)
             add_edge(graph, u, v, w)
             add_edge(graph, v, u, w)
     
@@ -819,7 +891,13 @@ def main(args):
                 sent_nodes, entity_nodes, relation_nodes,
                 sn_edges, sr_edges, nrn_edges,
                 semantic_edges=semantic_edges,
-                w_sn=args.w_sn, w_sr=args.w_sr, w_nrn=args.w_nrn, w_ss=args.w_ss,
+                w_sn=args.w_sn,
+                w_sr=args.w_sr,
+                w_nrn=args.w_nrn,
+                w_ss=args.w_ss,
+                w_ss_local=args.w_ss_local,
+                w_ss_semantic=args.w_ss_semantic,
+                local_sentence_window=args.local_sentence_window,
                 min_sen_sim=args.min_sen_sim
             )
 
@@ -929,6 +1007,9 @@ if __name__ == '__main__':
     parser.add_argument('--w_sr', type=float, default=0.6)
     parser.add_argument('--w_nrn', type=float, default=1.0)
     parser.add_argument('--w_ss', type=float, default=0.6)
+    parser.add_argument('--w_ss_local', type=float, default=None)
+    parser.add_argument('--w_ss_semantic', type=float, default=None)
+    parser.add_argument('--local_sentence_window', type=int, default=2)
     
     # PPR
     parser.add_argument('--ppr_alpha', type=float, default=0.7)
@@ -966,4 +1047,8 @@ if __name__ == '__main__':
     
     parser.add_argument('--out_path', type=str, default='./data/plan2/nodefc_[HOP]_[SPLIT].json')
     args = parser.parse_args()
+    if args.w_ss_local is None:
+        args.w_ss_local = float(args.w_ss)
+    if args.w_ss_semantic is None:
+        args.w_ss_semantic = 0.35 * float(args.w_ss)
     main(args)

@@ -150,7 +150,7 @@ def score_negation_compatibility(profile, candidate_text):
     return 0.0 if not sent_neg else -0.2
 
 
-def score_bridge_features(sid, target_support, context, semantic_sim_map, args):
+def score_bridge_features(sid, target_support, context, semantic_sim_map, args, allow_semantic=True):
     if (
         not target_support["sids"]
         and not target_support["docids"]
@@ -192,13 +192,19 @@ def score_bridge_features(sid, target_support, context, semantic_sim_map, args):
     constraint_overlap = sum(constraint_parts) / len(constraint_parts) if constraint_parts else 0.0
 
     semantic = 0.0
-    for target_sid in target_support["sids"]:
-        semantic = max(semantic, get_sim(semantic_sim_map, sid, target_sid))
+    if allow_semantic:
+        for target_sid in target_support["sids"]:
+            semantic = max(semantic, get_sim(semantic_sim_map, sid, target_sid))
 
     has_entity_bridge = bool(sent_eids & target_support["eids"])
     has_relation_bridge = bool(sent_rids & target_support["rids"])
     constraint_ready = constraint_overlap >= args.bridge_constraint_threshold
-    cross_doc = 1.0 if docid and target_support["docids"] and docid not in target_support["docids"] and (has_entity_bridge or has_relation_bridge or constraint_ready or semantic >= args.bridge_semantic_threshold) else 0.0
+    cross_doc = 1.0 if docid and target_support["docids"] and docid not in target_support["docids"] and (
+        has_entity_bridge
+        or has_relation_bridge
+        or constraint_ready
+        or (allow_semantic and semantic >= args.bridge_semantic_threshold)
+    ) else 0.0
     score = (
         0.44 * entity_overlap
         + 0.20 * relation_overlap
@@ -213,7 +219,7 @@ def score_bridge_features(sid, target_support, context, semantic_sim_map, args):
         has_entity_bridge
         or has_relation_bridge
         or constraint_ready
-        or semantic >= args.bridge_semantic_threshold
+        or (allow_semantic and semantic >= args.bridge_semantic_threshold)
         or cross_doc
         or (same_doc and not is_title)
     )
